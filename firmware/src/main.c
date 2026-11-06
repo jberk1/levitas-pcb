@@ -12,6 +12,7 @@
 #include "pico/util/queue.h"    // queue for multicore communication
 #include "pico/time.h"          // assorted time functions
 #include "hardware/spi.h"       // SPI for MAX5715
+#include "pico/stdio_usb.h"     // USB connection functions
 // also include our custom I2C PIO library
 #include "pio_i2c.h"
 
@@ -41,7 +42,7 @@
 #define FDC2112_REG_DEVICE_ID 0x7f
 
 typedef struct {
-    // store four capacitance values
+    // store four capacitance values for now
     int16_t data0;
     int16_t data1;
     int16_t data2;
@@ -402,7 +403,19 @@ void core2_main(){
         // WARNING: SENSORS SDA1,2,3,4 CORRESPOND TO HIGH VOLTAGE
         // OUTPUTS HV4,3,2,1 on PCB (NUMBERS ARE BACKWARD) (AND DAC
         // SPI ALSO HAS DIFFERENT WIRING).
-        printf("%llu 0x%04x 0x%04x 0x%04x 0x%04x %f %f %f %f\n", to_us_since_boot(get_absolute_time()), datapoint.data0, datapoint.data1, datapoint.data2, datapoint.data3, datapoint.hv0, datapoint.hv1, datapoint.hv2, datapoint.hv3);
+
+
+        printf("%llu 0x%04x 0x%04x 0x%04x 0x%04x %f %f %f %f\n", to_us_since_boot(get_absolute_time()), 
+            datapoint.data0,
+            datapoint.data1,
+            datapoint.data2,
+            datapoint.data3,
+            datapoint.hv0,
+            datapoint.hv1,
+            datapoint.hv2,
+            datapoint.hv3
+        );
+        
     }
 }
 
@@ -438,27 +451,33 @@ int main() {
     // (in case we want to do anything with it, though right now we don't)
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    gpio_put(PICO_DEFAULT_LED_PIN, 1);
 
     // set up FDC2112 sensors
-    PIO pio = pio0; // choose a PIO
+    PIO pio_0 = pio0; // choose a PIO
+
     uint sm0 = 0; // choose PIO state machine
     uint sm1 = 1; // choose PIO state machine
     uint sm2 = 2; // choose PIO state machine
     uint sm3 = 3; // choose PIO state machine
-    uint offset = pio_add_program(pio, &pio_i2c_program); // load program into PIO memory, return instruction memory offset it is loaded at
-    pio_i2c_program_init(pio, sm0, offset, 4, 5); // start PIO state machine at given instruction offset with given SDA and SCL pin
-    pio_i2c_program_init(pio, sm1, offset, 6, 7); // start PIO state machine at given instruction offset with given SDA and SCL pin
-    pio_i2c_program_init(pio, sm2, offset, 8, 9); // start PIO state machine at given instruction offset with given SDA and SCL pin
-    pio_i2c_program_init(pio, sm3, offset, 10, 11); // start PIO state machine at given instruction offset with given SDA and SCL pin
+    uint offset0 = pio_add_program(pio_0, &pio_i2c_program); // load program into PIO memory, return instruction memory offset it is loaded at
+    
+    pio_i2c_program_init(pio_0, sm0, offset0, 4, 5); // start PIO state machine at given instruction offset with given SDA and SCL pin
+    pio_i2c_program_init(pio_0, sm1, offset0, 6, 7); // start PIO state machine at given instruction offset with given SDA and SCL pin
+    pio_i2c_program_init(pio_0, sm2, offset0, 8, 9); // start PIO state machine at given instruction offset with given SDA and SCL pin
+    pio_i2c_program_init(pio_0, sm3, offset0, 10, 11); // start PIO state machine at given instruction offset with given SDA and SCL pin
+
     // wait a bit just in case fdc2112 sensors need time to initialize
     sleep_ms(500);
     // send configuration information to sensor
-    fdc2112_startup(pio, sm0);
-    fdc2112_startup(pio, sm1);
-    fdc2112_startup(pio, sm2);
-    fdc2112_startup(pio, sm3);
+    fdc2112_startup(pio_0, sm0);
+    fdc2112_startup(pio_0, sm1);
+    fdc2112_startup(pio_0, sm2);
+    fdc2112_startup(pio_0, sm3);
+    
     // we'll use this array to store data we read from the sensors
-    uint16_t result[] = {0x00, 0x00, 0x00, 0x00};
+    uint16_t result0[] = {0x00, 0x00, 0x00, 0x00};
+
     // Make a first reading from the sensors using fdc2112_read_register_4().
     // This is necessary because reading data from the sensors requires:
     //   1. Telling sensor which of its data we want to read (specify register)
@@ -467,7 +486,8 @@ int main() {
     // read data more quickly (via the read_register_nowrite() function).
     // However, we still need to do (1) at some point before that. This
     // function call does both (1) and (2).
-    fdc2112_read_register_4(pio, sm0, sm1, sm2, sm3, FDC2112_REG_DATA_CH0, result);
+    
+    fdc2112_read_register_4(pio0, sm0, sm1, sm2, sm3, FDC2112_REG_DATA_CH0, result0);
 
     // set up MAX5715 DAC
     spi_init(spi1, 5000*1000);
@@ -498,64 +518,118 @@ int main() {
     float hv3 = 0;
     bool high = false;
     absolute_time_t hv_start_time = get_absolute_time();
+    int pulse_length = 100; //stores on/off pulse length
+    float step_vol = 0;
+    bool startup = true;
 
     // Some variables to compare hardcoded capacitance values to
     // known min/max capacitance values to estimate position
     // WARNING: THESE TEND TO DRIFT OVER TIME AND NEED RECALIBRATION
-    uint16_t top_values[] = {0x0572, 0x06dd, 0x06ce, 0x064a};
-    uint16_t bottom_values[] = {0x04f2, 0x0665, 0x066c, 0x05ce};
-    uint16_t middle_values[] = {0,0,0,0};
-    for(int i=0; i<4; i++){
-        middle_values[i] = (top_values[i]+bottom_values[i])/2;
-    }
-    uint16_t oldresult[] = {0x00, 0x00, 0x00, 0x00};
+    // uint16_t top_values[] = {0x0588, 0x06e2, 0x06dd, 0x0655}; 
+    // uint16_t bottom_values[] = {0x050b, 0x065b, 0x0645, 0x05a6}; 
+    //TODO: linear extrapolation
+    // uint16_t middle_values[] = {0,0,0,0};
+    // for(int i=0; i<4; i++){
+    //     middle_values[i] = (top_values[i]+bottom_values[i])/2;
+    // }
 
+    uint16_t oldresult0[] = {0x00, 0x00, 0x00, 0x00};
+
+    // ===== linear ramp settings =====
+    const float    RAMP_START_V       = 0.0f;
+    const float    RAMP_END_V         = 180.0f;
+    const float    RAMP_RATE          = 40.0f;    // change ramp speed
+    const uint32_t RAMP_DELAY_MS      = 10000;   // buffer time after USB connection
+    bool ramp_started = false;
+    absolute_time_t ramp_t0 = get_absolute_time();
+    uint last_code = 0xFFFFFFFF;                 // forces the first DAC write
+
+    // ===== square pulse settings =====
+    const float hi = 220.0f;
     while(true){
 
         // ===== in case you want to blink LEDs =====
-        //gpio_put(PICO_DEFAULT_LED_PIN, true);
-        //gpio_put(PICO_DEFAULT_LED_PIN, false);
+        gpio_put(PICO_DEFAULT_LED_PIN, true);
+        gpio_put(PICO_DEFAULT_LED_PIN, false);
 
         // ===== read capacitance sensors =====
         // WARNING: SENSORS SDA1,2,3,4 CORRESPOND TO HIGH VOLTAGE
         // OUTPUTS HV4,3,2,1 on PCB (NUMBERS ARE BACKWARD) (AND DAC
         // SPI ALSO HAS DIFFERENT WIRING).
         // read quickly from the chip registers
-        for(int i=0; i<4; i++){oldresult[i] = result[i];}
-        fdc2112_read_register_nowrite_4(pio, sm0, sm1, sm2, sm3, result);
-        // discard 0x0fff values
+        for(int i=0; i<4; i++) {
+            oldresult0[i] = result0[i];
+        }
+
+        fdc2112_read_register_nowrite_4(pio_0, sm0, sm1, sm2, sm3, result0);
+        //discard 0x0fff values
         for(int i=0; i<4; i++){
-            //if(result[i] == 0x0fff){result[i] = oldresult[i];}
-            if(result[i] > 0x07d0){result[i] = oldresult[i];}
+            //if(result[i] == 0x0fff){result[i] = oldresult[i];} //omit
+            if(result0[i] > 0x07d0){result0[i] = oldresult0[i];}
         }
 
         // =============================
         // ===== High voltage code =====
         // =============================
-        // Uncomment only one of #1, #2, #3
+        // Uncomment only one of #1, #2, #3, #4
 
         // ===== output high voltage #1: do nothing =====
         // keep voltage at 0.
-        HVAWG_write_voltage(0,0,0,0);
+        //HVAWG_write_voltage(0,0,0,0);
 
         // ===== output high voltage #2: square wave =====
         // enable then disable high voltage slowly.
         // useful for testing whether movement works at all.
-        /*
-        absolute_time_t hv_now_time = get_absolute_time();
-        if(hv_now_time > delayed_by_ms(hv_start_time, 1000)){
-            high = !high;
-            hv0 = high?240:0;
-            hv1 = high?240:0;
-            hv2 = high?240:0;
-            hv3 = high?240:0;
-            HVAWG_write_voltage(hv0,hv1,hv2,hv3);
-            gpio_put(PICO_DEFAULT_LED_PIN, high); // also blink LED
-            hv_start_time = hv_now_time;
-        }
-        */
 
-        // ===== output high voltage #3: bang-bang controller=====
+        // absolute_time_t hv_now_time = get_absolute_time();
+        // if(hv_now_time > delayed_by_ms(hv_start_time, 1000)){
+        //     high = !high;
+        //     hv0 = high?hi:0;
+        //     hv1 = high?hi:0;
+        //     hv2 = high?hi:0;
+        //     hv3 = high?hi:0;
+        //     HVAWG_write_voltage(hv0,hv1,hv2,hv3);
+        //     gpio_put(PICO_DEFAULT_LED_PIN, high); // also blink LED
+        //     hv_start_time = hv_now_time;
+        // }
+
+        // ===== output high voltage #3: linear ramp =====
+        // triangle waveform
+
+        absolute_time_t now = get_absolute_time();
+        bool connected = stdio_usb_connected();
+
+        if (connected && !ramp_started) {
+            ramp_t0 = delayed_by_ms(now, RAMP_DELAY_MS); //set the start time
+            ramp_started = true;
+        }
+        if (!connected) { //reset on disconnect
+            ramp_started = false;
+        }
+
+        float v = RAMP_START_V;
+        if (ramp_started && time_reached(ramp_t0)) {
+            // length of one ramp (up or down) in microseconds
+            const int64_t half_us = (int64_t)((RAMP_END_V - RAMP_START_V) / RAMP_RATE * 1e6f);
+            // position within the current period (integer math so it
+            // stays accurate no matter how long the program runs)
+            int64_t t_us = absolute_time_diff_us(ramp_t0, now) % (2 * half_us);
+            if (t_us < half_us) {
+                v = RAMP_START_V + RAMP_RATE * (t_us / 1e6f);              // rising
+            } else {
+                v = RAMP_END_V - RAMP_RATE * ((t_us - half_us) / 1e6f);    // falling
+            }
+        }
+
+        uint code = (uint)(v / 66.7f / 4.096f * 4096.0f + 0.5f);
+        if (code != last_code) {// only touch SPI when the output changes
+            HVAWG_write_count(code, code, code, code);
+            last_code = code;
+        }
+        hv0 = hv1 = hv2 = hv3 = v; 
+
+
+        // ===== output high voltage #4: bang-bang controller=====
         // WARNING: REQUIRES HARDCODED MIN/MAX CAPACITANCE VALUES (SEE EARLIER
         // CODE ABOVE), WHICH NEED TO BE RECALIBRATED FREQUENTLY
         // naive bang-bang controller to try to keep rotor levitated in middle
@@ -578,7 +652,7 @@ int main() {
         */
 
         // send data to second core for printing
-        levitation_state_t entry = {result[0], result[1], result[2], result[3], hv0, hv1, hv2, hv3};
+        levitation_state_t entry = {result0[0], result0[1], result0[2], result0[3], hv0, hv1, hv2, hv3};
         // note: this causes significant (maybe ~20us) timing jitter
         queue_try_add(&data_queue, &entry); // nonblocking
 

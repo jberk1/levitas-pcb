@@ -32,7 +32,7 @@ endif()
 cmake_minimum_required(VERSION 3.13)
 
 # explicitly use the RP2350 on pico 2 dev board
-set(PICO_BOARD pico2)
+set(PICO_BOARD pico2 CACHE STRING "Board type")
 set(PICO_PLATFORM rp2350)
 
 # Use the specific version of the pico SDK (2.0.0) that we've
@@ -82,6 +82,8 @@ target_link_libraries(levitas
     pico_util
     pico_time
 )
+
+pico_add_extra_outputs(levitas)
 
 # UART on pins 0/1 is enabled by default. Disable it.
 pico_enable_stdio_uart(levitas 0)
