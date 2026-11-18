@@ -9,6 +9,7 @@
  */
 
 #include <stdio.h>
+#include "hardware/timer.h" // time_us_32, for timeout in the multi-bus functions
 #include "pio_i2c.h"
 
 // bit indices of assorted parts of instruction
@@ -627,5 +628,167 @@ uint pio_i2c_read_blocking_4(PIO pio, uint sm0, uint sm1, uint sm2, uint sm3, ui
         pio_i2c_stop(pio, sm3); // send a stop signal no matter `nostop`
     }
     return err;
+}
+
+// ============================================================================
+// Multi-bus versions (used by main_v2.c for eight sensors)
+// ============================================================================
+//
+// These do the same thing as the _4 functions above, with three differences:
+//
+// 1. They take a list of buses instead of four state machine numbers, so
+//    the buses can be on different PIOs (a PIO only has four state machines).
+//
+// 2. Each bus is tracked separately. In the _4 functions, a NAK on one bus
+//    stops the transaction on all four. Here the bus that failed is dropped
+//    and the others finish normally, so one missing/broken sensor does not
+//    corrupt the readings of the rest.
+//
+// 3. There is a timeout. The _4 functions wait forever if a state machine
+//    never finishes (e.g., it is waiting for an SCL line that is shorted to
+//    ground to go high). Here those buses are reset and reported as failed.
+
+// Restart a state machine that got stuck in the middle of a transaction.
+// This is heavier than pio_i2c_resume_after_error(): a stuck state machine
+// can be partway through a byte, so its shift registers also need clearing
+// (otherwise it would start reading the next command from the wrong bit).
+static void pio_i2c_resume_after_timeout(PIO pio, uint sm) {
+    pio_sm_set_enabled(pio, sm, false);
+    // empty both FIFO buffers
+    pio_sm_clear_fifos(pio, sm);
+    // clear shift registers/counters and anything the state machine is waiting on
+    pio_sm_restart(pio, sm);
+    // jump back to the entry point (beginning of wrap loop)
+    pio_sm_exec(pio, sm, (pio->sm[sm].execctrl & PIO_SM0_EXECCTRL_WRAP_BOTTOM_BITS) >> PIO_SM0_EXECCTRL_WRAP_BOTTOM_LSB);
+    // clear interrupt
+    pio_interrupt_clear(pio, sm);
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+// Shared code for pio_i2c_write_blocking_n() and pio_i2c_read_blocking_n().
+// If rxbuf == NULL this is a write of `len` bytes from txbuf (same bytes sent
+// to every bus). Otherwise it is a read of `len` bytes per bus into rxbuf.
+static uint pio_i2c_transfer_n(const pio_i2c_bus_t *bus, uint n, uint8_t addr, const uint8_t *txbuf, uint8_t *rxbuf, uint len, bool nostop) {
+    const bool is_read = (rxbuf != NULL);
+    if (n > PIO_I2C_MAX_BUSES) { n = PIO_I2C_MAX_BUSES; }
+
+    // Track the number of things added and removed from each state machine's
+    // FIFO buffers (see pio_i2c_write_blocking() for the full explanation).
+    uint bytes_sent[PIO_I2C_MAX_BUSES];
+    uint bytes_received[PIO_I2C_MAX_BUSES];
+
+    // When this function begins, we expect both TX and RX FIFO buffers to
+    // be empty, but in case a previous function messed up we'll fix that.
+    for (uint i = 0; i < n; i++) {
+        while (!pio_sm_is_rx_fifo_empty(bus[i].pio, bus[i].sm)) { pio_i2c_get(bus[i].pio, bus[i].sm); }
+    }
+
+    // Send commands to execute an I2C start signal on every bus.
+    for (uint i = 0; i < n; i++) {
+        pio_i2c_start(bus[i].pio, bus[i].sm);
+    }
+
+    // Begin by sending the device address.
+    // (expect ack, 8 bits (address + 0 for write / 1 for read), don't send master ack)
+    for (uint i = 0; i < n; i++) {
+        pio_i2c_put16_or_err(bus[i].pio, bus[i].sm, (addr << 2) | (is_read ? 3u : 1u));
+        bytes_sent[i] = 1;
+        bytes_received[i] = 0;
+    }
+
+    // Now send/receive every other byte. Visit the buses in turn; each one is
+    // done once it has sent and received len+1 bytes (+1 for the address).
+    uint pending = (1u << n) - 1; // bit i set = bus i still busy
+    uint err = 0;                 // bit i set = bus i failed
+    uint timed_out = 0;           // bit i set = bus i failed by getting stuck
+    const uint32_t start_time = time_us_32();
+    while (pending) {
+        for (uint i = 0; i < n; i++) {
+            if (!(pending & (1u << i))) { continue; }
+            PIO pio = bus[i].pio;
+            uint sm = bus[i].sm;
+
+            // I2C ack failed: stop using this bus (it is reset further below)
+            if (pio_i2c_check_error(pio, sm)) {
+                err |= 1u << i;
+                pending &= ~(1u << i);
+                continue;
+            }
+
+            if (!pio_sm_is_tx_fifo_full(pio, sm) && bytes_sent[i] < len+1) {
+                if (is_read) {
+                    // dummy byte
+                    // (send 0xff (doesn't write to bus b/c pullup), expect NAK on final byte, otherwise have master send ack)
+                    pio_i2c_put16_nocheck(pio, sm, (0xffu << 1) | ((bytes_sent[i] < len) ? 0 : (1u << PIO_I2C_FINAL_LSB) | (1u << PIO_I2C_NAK_LSB)));
+                } else {
+                    // data byte
+                    // (expect ack (except on last byte), 8 bits, don't send master ack)
+                    pio_i2c_put16_nocheck(pio, sm, (txbuf[bytes_sent[i]-1] << PIO_I2C_DATA_LSB) | ((bytes_sent[i] == len) << PIO_I2C_FINAL_LSB) | 1u);
+                }
+                bytes_sent[i] += 1;
+            }
+
+            if (!pio_sm_is_rx_fifo_empty(pio, sm) && bytes_received[i] < len+1) {
+                uint8_t byte = pio_i2c_get(pio, sm);
+                // (the first byte is a dummy produced by sending the address,
+                // and when writing all of them are dummies)
+                if (is_read && bytes_received[i] > 0) {
+                    rxbuf[i*len + bytes_received[i]-1] = byte;
+                }
+                bytes_received[i] += 1;
+            }
+
+            if (bytes_sent[i] == len+1 && bytes_received[i] == len+1) {
+                pending &= ~(1u << i);
+            }
+        }
+
+        // don't get stuck in infinite loop if a bus never finishes
+        if (pending && (time_us_32() - start_time) > PIO_I2C_TIMEOUT_US) {
+            timed_out = pending;
+            err |= pending;
+            pending = 0;
+        }
+    }
+
+    // Finally, send an I2C stop condition (unless a restart is requested;
+    // see pio_i2c_write_blocking()).
+    for (uint i = 0; i < n; i++) {
+        if (err & (1u << i)) { continue; }
+        if (nostop) {
+            pio_i2c_restart_stop(bus[i].pio, bus[i].sm);
+        } else {
+            pio_i2c_stop(bus[i].pio, bus[i].sm);
+        }
+    }
+
+    // If a state machine hit an error at any previous point, restart it.
+    for (uint i = 0; i < n; i++) {
+        PIO pio = bus[i].pio;
+        uint sm = bus[i].sm;
+        if (timed_out & (1u << i)) {
+            pio_i2c_resume_after_timeout(pio, sm);
+            pio_i2c_stop(pio, sm); // release the bus
+        } else if ((err & (1u << i)) || pio_i2c_check_error(pio, sm)) {
+            err |= 1u << i;
+            pio_i2c_resume_after_error(pio, sm);
+            pio_i2c_stop(pio, sm); // send a stop signal no matter `nostop`
+        }
+    }
+    return err;
+}
+
+// Send an identical I2C write command to `n` buses at the same time.
+// Works like pio_i2c_write_blocking(). Returns a bitmask of failed buses.
+uint pio_i2c_write_blocking_n(const pio_i2c_bus_t *bus, uint n, uint8_t addr, const uint8_t *txbuf, uint len, bool nostop) {
+    return pio_i2c_transfer_n(bus, n, addr, txbuf, NULL, len, nostop);
+}
+
+// Send an identical I2C read command to `n` buses at the same time.
+// Works like pio_i2c_read_blocking(). The `len` bytes read from bus[i] are
+// stored at rxbuf[i*len] (so rxbuf must hold n*len bytes; ignore the bytes
+// belonging to a bus that failed). Returns a bitmask of failed buses.
+uint pio_i2c_read_blocking_n(const pio_i2c_bus_t *bus, uint n, uint8_t addr, uint8_t *rxbuf, uint len) {
+    return pio_i2c_transfer_n(bus, n, addr, NULL, rxbuf, len, false);
 }
 

@@ -29,6 +29,9 @@ reload:
 build-then-reload: build
 	picotool load -v -x -f build/levitas.elf
 
+# (The firmware for the second version of the PCB is a separate project
+# with its own Makefile, in the "firmware_v2" folder.)
+
 # remove build directory and files
 clean:
 	rm -rf build

@@ -18,9 +18,9 @@ if(WIN32)
 else()
     set(USERHOME $ENV{HOME})
 endif()
-set(sdkVersion 2.0.0)
-set(toolchainVersion 13_2_Rel1)
-set(picotoolVersion 2.0.0)
+set(sdkVersion 2.3.1)
+set(toolchainVersion 15_2_Rel1)
+set(picotoolVersion 2.3.1)
 set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
 if (EXISTS ${picoVscode})
     include(${picoVscode})
@@ -31,25 +31,33 @@ endif()
 
 cmake_minimum_required(VERSION 3.13)
 
-# explicitly use the RP2350 on pico 2 dev board
+# Use the RP2350 on the Pico 2 dev board.
+# ("pico2" firmware also runs on a Pico 2 W: same microcontroller and header
+# pins. The only difference is the LED; see USE_LED in src/main_v2.c.)
 set(PICO_BOARD pico2 CACHE STRING "Board type")
 set(PICO_PLATFORM rp2350)
 
-# Use the specific version of the pico SDK (2.0.0) that we've
-# put into this git repo (instead of using one stored externally).
-# (the alternative is using pico_sdk_import.cmake to automatically
-# find the pico SDK folder, but we chose not to do that)
-# This is mainly for long-term stability.
+# Find the Pico SDK.
+# - With the VS Code extension, PICO_SDK_PATH was set above to the SDK the
+#   extension downloaded (~/.pico-sdk/sdk/<sdkVersion>).
+# - Otherwise (e.g., Linux command line with no PICO_SDK_PATH environment
+#   variable), use the copy of the SDK stored in this git repo.
 # (note: this must happen before project())
-include(pico-sdk/pico_sdk_init.cmake)
+if(NOT PICO_SDK_PATH AND NOT DEFINED ENV{PICO_SDK_PATH})
+    set(PICO_SDK_PATH ${CMAKE_CURRENT_LIST_DIR}/pico-sdk)
+endif()
+include(pico_sdk_import.cmake)
 
 # define project name
-project(levitas)
+project(levitas C CXX ASM)
 
 # initialize Raspberry Pi Pico SDK
 pico_sdk_init()
 
-# define local project files
+# ====================================================================================
+# Firmware for the first version of the PCB (four FDC2112 sensors, high voltage).
+# (build/levitas.uf2, build/levitas.elf)
+
 add_executable(levitas
     # main program
     src/main.c
@@ -83,8 +91,6 @@ target_link_libraries(levitas
     pico_time
 )
 
-pico_add_extra_outputs(levitas)
-
 # UART on pins 0/1 is enabled by default. Disable it.
 pico_enable_stdio_uart(levitas 0)
 
@@ -96,3 +102,6 @@ pico_enable_stdio_usb(levitas 1)
 
 # create map/bin/hex/uf2 files in addition to ELF
 pico_add_extra_outputs(levitas)
+
+# (The firmware for the second version of the PCB, levitas_v2, is a separate
+# project in the "firmware_v2" folder.)

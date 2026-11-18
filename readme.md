@@ -52,7 +52,12 @@ Inside the `firmware` folder:
 - `src/main.c` is the main source code file and holds the main LeviTAS control loop.
   - by default, this only prints capacitive sensor readings over USB; high voltage is set to zero
   - uncomment code in the main loop to enable high voltage output
-- `src/pio_i2c.c`, `src/pio_i2c.h`, and `src/pio_i2c.pio` together form a library that can run I2C communication via the Pico PIOs. `src/main.c` uses this library to run four I2C ports in parallel (to connect to four FDC2112 chips).
+- `src/main_v2.c` is the main source code file for the second version of the PCB (`levitas_v2`, eight FDC2112 chips). It is compiled into a separate program, `build/levitas_v2.uf2` (the first PCB's program is `build/levitas.uf2`); load the one that matches your PCB.
+  - on Linux, use `make build-v2` / `make reload-v2` (or `make v2` to do both)
+  - this only prints the eight capacitive sensor readings over USB; it does not output high voltage
+  - works on a Pico 2 or a Pico 2 W (set `USE_LED` at the top of the file to 1 only for a plain Pico 2)
+  - sending the word `bootsel` over the serial port restarts the Pico into BOOTSEL mode, as a backup for "Run Project (USB)" when loading new firmware without pressing the BOOTSEL button
+- `src/pio_i2c.c`, `src/pio_i2c.h`, and `src/pio_i2c.pio` together form a library that can run I2C communication via the Pico PIOs. `src/main.c` uses this library to run four I2C ports in parallel (to connect to four FDC2112 chips). `src/main_v2.c` uses the `_n` functions of the same library to run eight I2C ports in parallel, split over two PIOs.
 - the following test code is unused but can be enabled by changing `CMakeLists.txt` to make them the main project file instead of `main.c`:
   - `src/test_fdc2112_i2c.c` tests only two of the four connected FDC2112 chips by using the two hardware built-in I2C modules (instead of PIO)
   - `src/test_fdc2112_pio_i2c.c` tests all four connected FDC2112 chips using the PIO library, and is almost identical to code in `src/main.c`.
@@ -67,6 +72,8 @@ Other files:
 ## Data Collection
 
 The `data-collection/collect-data.py` and `data-collection/graph-data.py` Python programs in the `data-collection` subfolder of the main git repo can be used to automatically read the data the microcontroller sends over USB, then graph it. This provides much more useful data than manually looking at the printed output in a serial monitor.
+
+For the second version of the PCB (eight sensors), `data-collection/levitas_v2_gui.py` shows the position of the levitating mass live: a 3D view, x/y/z versus time, and the three rotations versus time. It needs the `pyserial` module (`pip install pyserial`); run it with `python levitas_v2_gui.py` and choose the Pico's serial port, or with `--simulate` to try it without hardware. The comment at the top of the file explains how the sensor readings are converted to position and how to calibrate it.
 
 ## Some Useful Notes
 

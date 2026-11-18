@@ -1,0 +1,41 @@
+# This is a makefile when building this software via command line on Linux.
+# Not used when using the Raspbbery Pi Pico VS Code extension.
+#
+# Needs the PICO_SDK_PATH environment variable to point to a Pico SDK
+# folder, version 2.1.0 or newer (see CMakeLists.txt).
+#
+# Commonly used commands:
+# - "make build" to compile only
+# - "make reload" to load onto Pico in USB mode
+# - "make" or "make all" to do both
+
+# by default, compile (if need be) then upload and start program
+all: build-then-reload
+
+# compile firmware for Pico board but do not run
+build:
+	mkdir -p build
+	rm -rf build/*
+	cd build && cmake ..
+	cd build && make levitas_v2
+
+# upload and verify only
+# requires board to start in BOOTSEL mode
+load:
+	picotool load -v build/levitas_v2.elf
+
+# upload, verify, then start program
+# works either if board is in BOOTSEL mode
+# or if it is running with default USB communication (pico_stdio_usb library included)
+reload:
+	picotool load -v -x -f build/levitas_v2.elf
+build-then-reload: build
+	picotool load -v -x -f build/levitas_v2.elf
+
+# remove build directory and files
+clean:
+	rm -rf build
+
+# make these Makefile rules run every time
+# (instead of make's only-run-if-new thing)
+.PHONY: all build load reload build-then-reload clean

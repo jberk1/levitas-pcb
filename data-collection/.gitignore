@@ -1,2 +1,4 @@
 # Don't save recorded data to git
 data.dat
+# Calibration saved by levitas_v2_gui.py (specific to one device and setup)
+levitas_v2_calibration.json
