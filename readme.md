@@ -59,7 +59,12 @@ Inside the `firmware` folder:
     - `bootsel` turns high voltage off and restarts the Pico into BOOTSEL mode, as a backup for "Run Project (USB)" when loading new firmware without pressing the BOOTSEL button
   - each data line is: time (us), four sensor readings, four voltages, then height (% of travel), target height (%) and mode; lines starting with `#` are messages
   - high voltage is never commanded above 240V, and is turned off when the serial port is closed, when a sensor stops responding, when the mass appears stuck, and before any restart into BOOTSEL mode
-  - an explanation of the controller is in the comment above `main()`
+  - an explanation of the controller is in the comment above `control_main()`
+  - notes from the first levitation tests (2026-11-18):
+    - the voltage moves the mass toward the sense electrodes whichever way up the board is, so the board must be upside down (sense electrodes above the mass) for the voltage to lift the mass against gravity; the other way up it only presses the mass onto the stop it rests on
+    - with the default gains (`kp 10`, `kd 0.001`, `fc 100`) the mass held its height to about 0.1% of its travel for 20s at about 40V; it hovers a few % of travel away from the setpoint (normal for a PD controller) and tilted (only the average height is controlled)
+    - the mass left its rest stop at 174-189V when the device had been left alone for a couple of minutes, but after several runs in a row even 240V only tipped it up on one side; switching the high voltage off for about two minutes fixed that each time (probably electric charge building up on the device). If `cal` fails, wait and try again
+    - if the mass does not move at all at 240V it is physically stuck; tap the device
 - `src/main_v2.c` is the main source code file for the second version of the PCB (`levitas_v2`, eight FDC2112 chips). It is compiled into a separate program, `build/levitas_v2.uf2` (the first PCB's program is `build/levitas.uf2`); load the one that matches your PCB.
   - on Linux, use `make build-v2` / `make reload-v2` (or `make v2` to do both)
   - this only prints the eight capacitive sensor readings over USB; it does not output high voltage

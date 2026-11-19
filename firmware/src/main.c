@@ -486,20 +486,25 @@ void __attribute__((noreturn)) __wrap_rom_reset_usb_boot_extra(int usb_activity_
 // ----- calibration ("cal" command) -----
 #define CAL_SETTLE_LOOPS MS_TO_LOOPS(300)  // wait for the mass to settle
 #define CAL_AVERAGE_LOOPS MS_TO_LOOPS(200) // then average readings this long
-// (same two, but at the top stop with full voltage: kept short because the
+// (same two, but at the top stop with voltage on: kept short because the
 // mass tends to stick to the top stop)
-#define CAL_TOP_SETTLE_LOOPS MS_TO_LOOPS(100)
+#define CAL_TOP_SETTLE_LOOPS MS_TO_LOOPS(200)
 #define CAL_TOP_AVERAGE_LOOPS MS_TO_LOOPS(100)
-#define CAL_RAMP_V_PER_S 200.0f            // how fast the voltage is ramped
-#define CAL_MOVE_COUNTS 20.0f // (ramp up) mass has left the bottom when the average reading changed this much
+#define CAL_RAMP_V_PER_S 100.0f            // how fast the voltage is ramped
+#define CAL_MOVE_COUNTS 20.0f // (ramp up) mass has left the bottom when the reading of EVERY sensor changed this much
 #define CAL_MIN_SPAN 30.0f    // every sensor must change at least this many counts between the two stops
+// (at the end) how long to wait at 0V for the mass to drop back down before
+// warning that it is stuck (it normally clings to the top stop for about 1s)
+#define CAL_RELEASE_LOOPS MS_TO_LOOPS(4000)
 
 // ----- controller ("start" command) -----
 // how fast the target height moves to a new setpoint (fraction of travel per second)
 #define SETPOINT_SLEW_PER_S 2.0f
 // stop if the mass sits at the top with 0V, or at the bottom with full
 // voltage, for this long (it is probably physically stuck)
-#define STUCK_TOP_LOOPS MS_TO_LOOPS(500)
+// (at the top it normally lets go by itself about 1s after the voltage is
+// removed, so wait longer than that)
+#define STUCK_TOP_LOOPS MS_TO_LOOPS(3000)
 #define STUCK_BOTTOM_LOOPS MS_TO_LOOPS(1000)
 
 // ===========================================================================
@@ -765,8 +770,15 @@ static inline float clampf(float x, float low, float high){
 //   voltage = v_weight(z) * sqrt(force)
 // v0 and v1 are measured by "cal" (the voltages at which the mass leaves the
 // bottom and top stops). They are only approximate (the mass tends to stick
-// to the stops), which mostly shows up as the mass hovering a bit away from
-// the target height; adjust v0/v1 to trim that.
+// to the stops; if it is still stuck to the top stop at 0V, v1 is set to 0),
+// which mostly shows up as the mass hovering a bit away from the target
+// height; adjust v0/v1 to trim that.
+//
+// NOTE: on this device the voltage moves the mass toward the sense
+// electrodes (the readings go down), whichever way up the board is. "Top
+// stop" in this file means the stop on that side. So the board has to be
+// mounted with the sense electrodes above the mass (upside down compared to
+// the other way) for the voltage to work against gravity.
 static void control_main() {
 
     // set up MAX5715 DAC and set high voltage to zero
@@ -839,25 +851,30 @@ static void control_main() {
     uint32_t work_loops = 0;
 
     // ===== settings that can be changed with commands =====
-    // Starting gains, worked out for a mass of about 100mg that can travel
-    // about L=80um (the gap to the electrodes). With the control law above,
-    // the height z (as a fraction of L) behaves like a mass on a spring:
-    //   z'' + (kd*g/L + air damping) z' + (kp*g/L) z = (kp*g/L) z_target
-    // where g=9.81m/s^2, so g/L = 123000 1/s^2. (The mass itself cancels out
-    // because the force is in units of its weight.)
-    // - kp=5 gives a natural frequency of sqrt(kp*g/L) = 780rad/s = 125Hz,
-    //   well below the 6.7kHz loop rate
-    // - kd=0.010 gives a damping ratio of kd*(g/L)/(2*780) = 0.8 even with
-    //   no help from air damping
-    // If the travel L is really shorter, both act stronger in proportion
-    // (e.g., half the travel: use half the kp and kd for the same behavior).
-    float kp = 5.0f;        // proportional gain
-    float kd = 0.010f;      // derivative gain
+    // Gains, tuned on the real device (2026-11-18: about 100mg mass, about
+    // 80um gap, in air, board upside down so the voltage lifts the mass).
+    // What the measurements showed:
+    // - The air squeezed between the mass and the plates damps the motion
+    //   heavily: at a fixed voltage the mass takes about 0.1s to cross from
+    //   one stop to the other. So the controller needs very little damping
+    //   of its own, and everything is slow compared with the 6.7kHz loop.
+    // - Levitation was stable for every kp tried from 2 to 20 and kd from 0
+    //   to 0.004. Higher kp makes the mass hover closer to the target height
+    //   (a PD controller always leaves a small offset: about 4% of travel
+    //   at kp=10, 2% at kp=20).
+    // - Too much kd (0.010) made the voltage jump by tens of volts from one
+    //   loop to the next, because the kd term amplifies sensor noise, and
+    //   such fast voltage jumps also upset the sensors. Hence the small kd
+    //   and the low filter cutoff frequency below.
+    // - With these values the height holds to about 0.1% of travel and the
+    //   voltage to about 1V.
+    float kp = 10.0f;       // proportional gain
+    float kd = 0.001f;      // derivative gain
     float setpoint = 0.5f;  // target height (fraction of travel)
     float v0 = 210.0f;      // voltage balancing gravity at the bottom stop
     float v1 = 10.0f;       // voltage balancing gravity at the top stop
     float vmax = HV_ABS_MAX_V; // highest voltage to use
-    float fc = 1000.0f;     // low-pass filter cutoff frequency (Hz) (well above the 125Hz above so the filter delay doesn't upset the controller)
+    float fc = 100.0f;      // low-pass filter cutoff frequency (Hz)
     float filter_alpha = 1.0f - expf(-2.0f*3.14159265f*fc*LOOP_DT);
     uint32_t stream_every = 1; // print every Nth data line
 
@@ -881,6 +898,7 @@ static void control_main() {
     float cal_sum[4] = {0, 0, 0, 0};
     float cal_lift_v = 0;           // voltage at which the mass left the bottom stop
     float cal_release_v = 0;        // voltage at which the mass left the top stop
+    float cal_hold_v = 0;           // voltage used to hold the mass at the top stop
     bool cal_lift_seen = false;
     bool cal_release_seen = false;
 
@@ -992,7 +1010,7 @@ static void control_main() {
                     cal_valid = false;
                     cal_step = CAL_REST_SETTLE;
                     cal_loops = 0;
-                    say("calibrating (takes about 3 seconds)...");
+                    say("calibrating (takes 6 to 10 seconds)...");
                 }
                 break;
             case CMD_START:
@@ -1063,8 +1081,12 @@ static void control_main() {
             // bottom stop (0V) and on the top stop (full voltage), and at
             // what voltage it leaves each stop.
             cal_loops += 1;
-            float average_drop = 0.25f*((cal_bottom[0]-filtered[0]) + (cal_bottom[1]-filtered[1])
-                                      + (cal_bottom[2]-filtered[2]) + (cal_bottom[3]-filtered[3]));
+            // how far the corner of the mass that has moved the least has
+            // come up from the bottom stop (in sensor counts)
+            float smallest_drop = cal_bottom[0] - filtered[0];
+            for(int i=1; i<4; i++){
+                if(cal_bottom[i] - filtered[i] < smallest_drop){ smallest_drop = cal_bottom[i] - filtered[i]; }
+            }
             switch(cal_step){
             case CAL_REST_SETTLE: // 0V, let the mass settle on the bottom stop
                 hv = 0;
@@ -1084,24 +1106,32 @@ static void control_main() {
                 break;
             case CAL_RAMP_UP: // raise voltage slowly, note when the mass lifts off
                 hv += CAL_RAMP_V_PER_S*LOOP_DT;
-                if(!cal_lift_seen && average_drop > CAL_MOVE_COUNTS){
+                // (All four corners must have left the bottom. The mass
+                // usually tips up on one side first and can sit like that,
+                // one corner still down, over a range of voltages.)
+                if(!cal_lift_seen && smallest_drop > CAL_MOVE_COUNTS){
                     cal_lift_seen = true;
                     cal_lift_v = hv;
                 }
-                if(hv >= vmax){
-                    hv = vmax;
+                // Stop raising the voltage as soon as the mass has lifted off:
+                // it then carries on to the top stop by itself (the pull gets
+                // stronger as it rises), and the less voltage it is held there
+                // with, the less it tends to stick. Otherwise go up to vmax.
+                if(cal_lift_seen || hv >= vmax){
+                    if(hv > vmax){ hv = vmax; }
+                    cal_hold_v = hv;
                     cal_step = CAL_TOP_SETTLE; cal_loops = 0;
                 }
                 break;
-            case CAL_TOP_SETTLE: // full voltage, let the mass settle on the top stop
-                hv = vmax;
+            case CAL_TOP_SETTLE: // hold that voltage, let the mass settle on the top stop
+                hv = cal_hold_v;
                 if(cal_loops >= CAL_TOP_SETTLE_LOOPS){
                     for(int i=0; i<4; i++){ cal_sum[i] = 0; }
                     cal_step = CAL_TOP_AVERAGE; cal_loops = 0;
                 }
                 break;
             case CAL_TOP_AVERAGE: // average the readings at the top stop
-                hv = vmax;
+                hv = cal_hold_v;
                 for(int i=0; i<4; i++){ cal_sum[i] += good[i]; }
                 if(cal_loops >= CAL_TOP_AVERAGE_LOOPS){
                     bool moved = true;
@@ -1110,7 +1140,7 @@ static void control_main() {
                         if(cal_span[i] < CAL_MIN_SPAN){ moved = false; }
                     }
                     if(!moved){
-                        say("CAL FAILED: the mass did not move at %.0f V (is it stuck?). High voltage off.", vmax);
+                        say("CAL FAILED: the mass did not move at %.0f V (is it stuck?). High voltage off.", cal_hold_v);
                         say("  sensor change bottom->top = %.1f %.1f %.1f %.1f counts (need at least %.0f each)",
                             cal_span[0], cal_span[1], cal_span[2], cal_span[3], CAL_MIN_SPAN);
                         mode = MODE_IDLE;
@@ -1134,9 +1164,9 @@ static void control_main() {
                     cal_step = CAL_END_SETTLE; cal_loops = 0;
                 }
                 break;
-            case CAL_END_SETTLE: // 0V, check the mass came back down
+            case CAL_END_SETTLE: // 0V, wait for the mass to come back down
                 hv = 0;
-                if(cal_loops >= CAL_SETTLE_LOOPS){
+                if((z < 0.2f && cal_loops >= CAL_SETTLE_LOOPS) || cal_loops >= CAL_RELEASE_LOOPS){
                     if(cal_lift_seen){ v0 = cal_lift_v; }
                     v1 = cal_release_seen ? cal_release_v : 0;
                     say("cal done. bottom = %.1f %.1f %.1f %.1f counts", cal_bottom[0], cal_bottom[1], cal_bottom[2], cal_bottom[3]);

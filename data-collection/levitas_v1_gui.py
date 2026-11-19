@@ -30,7 +30,7 @@ shown is the total capacitance of that tank worked out from the frequency.
 Its absolute value is only approximate (the chip's internal oscillator and the
 inductor both vary by several percent from part to part); the CHANGE in
 capacitance is much more trustworthy. Higher reading = lower capacitance =
-mass further from the electrodes.
+mass further from the sense electrodes.
 
 Height: each sensor's reading is compared with two reference readings, one
 taken with the mass resting on its bottom stop and one with the mass against
