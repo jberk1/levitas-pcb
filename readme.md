@@ -50,8 +50,16 @@ Inside the `firmware` folder:
 
 - `CMakeLists.txt` configures compilation, and must be manually changed to include new source code files or other settings (e.g., importing a new sublibrary for the Pico SDK)
 - `src/main.c` is the main source code file and holds the main LeviTAS control loop.
-  - by default, this only prints capacitive sensor readings over USB; high voltage is set to zero
-  - uncomment code in the main loop to enable high voltage output
+  - after power-up, this only prints capacitive sensor readings over USB; high voltage is set to zero
+  - it takes commands typed into the serial monitor, one per line (type `help` for the full list):
+    - `cal` calibrates the sensors by lifting the mass to its top stop and back (needed after every power-up)
+    - `start` starts a PD controller that levitates the mass at a set height between its two stops (height only: all four electrodes get the same voltage; tilt is not controlled); `stop` turns high voltage off
+    - `sp`, `kp`, `kd`, `v0`, `v1`, `fc` change the target height and controller tuning while it runs; `status` prints them
+    - `hv 100` applies a fixed voltage (here 100V) to all four outputs, for testing
+    - `bootsel` turns high voltage off and restarts the Pico into BOOTSEL mode, as a backup for "Run Project (USB)" when loading new firmware without pressing the BOOTSEL button
+  - each data line is: time (us), four sensor readings, four voltages, then height (% of travel), target height (%) and mode; lines starting with `#` are messages
+  - high voltage is never commanded above 240V, and is turned off when the serial port is closed, when a sensor stops responding, when the mass appears stuck, and before any restart into BOOTSEL mode
+  - an explanation of the controller is in the comment above `main()`
 - `src/main_v2.c` is the main source code file for the second version of the PCB (`levitas_v2`, eight FDC2112 chips). It is compiled into a separate program, `build/levitas_v2.uf2` (the first PCB's program is `build/levitas.uf2`); load the one that matches your PCB.
   - on Linux, use `make build-v2` / `make reload-v2` (or `make v2` to do both)
   - this only prints the eight capacitive sensor readings over USB; it does not output high voltage
@@ -72,6 +80,8 @@ Other files:
 ## Data Collection
 
 The `data-collection/collect-data.py` and `data-collection/graph-data.py` Python programs in the `data-collection` subfolder of the main git repo can be used to automatically read the data the microcontroller sends over USB, then graph it. This provides much more useful data than manually looking at the printed output in a serial monitor.
+
+For the first version of the PCB (four sensors, high voltage), `data-collection/levitas_v1_gui.py` shows the four capacitance sensor readings live (raw value and estimated capacitance), plots the height (z) of the levitating mass and the applied voltage versus time, and has a slider to set the high voltage on the mass by hand (plus an "HV OFF" button, also on the Esc key, and a box to type any other firmware command such as `cal` or `start`). It needs the `pyserial` module; run it with `python levitas_v1_gui.py` and choose the Pico's serial port, or with `--simulate` to try it without hardware. Only one program can use the serial port at a time, so close the VS Code serial monitor first. The comment at the top of the file explains how readings are converted to capacitance and height, and how to set the two reference readings ("Set BOTTOM" / "Set TOP").
 
 For the second version of the PCB (eight sensors), `data-collection/levitas_v2_gui.py` shows the position of the levitating mass live: a 3D view, x/y/z versus time, and the three rotations versus time. It needs the `pyserial` module (`pip install pyserial`); run it with `python levitas_v2_gui.py` and choose the Pico's serial port, or with `--simulate` to try it without hardware. The comment at the top of the file explains how the sensor readings are converted to position and how to calibrate it.
 

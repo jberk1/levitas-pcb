@@ -10,10 +10,11 @@ data = []
 with open('data.dat', 'r') as infile:
     for line in infile:
         values_raw = line.split()
-        if len(values_raw) < 9:
+        if len(values_raw) < 9 or values_raw[0].startswith('#'):
             # sometimes the first or last line wasn't fully read if the
             # data collection program start/end didn't sync up with the
             # microcontroller, so ignore those lines
+            # (also ignore messages from the firmware, which start with '#')
             continue
         values = []
         values.append(int(values_raw[0],0)) # time since program started in microseconds (integer)

@@ -33,7 +33,7 @@ bad_lines = 0         # running count of malformed / out-of-range / out-of-order
 def parse(line):
     """Return (t_us, [4 raw], [4 hv]) or None if the line is malformed."""
     parts = line.split()
-    if len(parts) != 9:                 # timestamp + 4 hex + 4 floats
+    if len(parts) < 9:                  # timestamp + 4 hex + 4 floats (+ height %, target %, mode: not used here)
         return None
     try:
         t = int(parts[0])

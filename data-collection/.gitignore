@@ -2,3 +2,5 @@
 data.dat
 # Calibration saved by levitas_v2_gui.py (specific to one device and setup)
 levitas_v2_calibration.json
+# Height calibration saved by levitas_v1_gui.py (specific to one device and setup)
+levitas_v1_calibration.json

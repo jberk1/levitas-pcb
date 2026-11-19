@@ -4,15 +4,25 @@
 // It contains code to read from four FDC2112 capacitance sensors,
 // write voltages to a 4-channel MAX5715 DAC (connected to a HV264
 // amplifier), and write data out via a serial port (over USB).
+//
+// It also runs a PD controller that levitates the mass at a chosen height
+// between its two stops, and takes commands over the USB serial port
+// (type "help" in a serial monitor; see the list of commands further down).
 
 // include necessary standard libraries
 #include "pico/stdlib.h"        // standard functions
 #include <stdio.h>              // printf
-#include "pico/multicore.h"     // send USB printf on second core
+#include "pico/multicore.h"     // run the control loop on the second core
 #include "pico/util/queue.h"    // queue for multicore communication
 #include "pico/time.h"          // assorted time functions
 #include "hardware/spi.h"       // SPI for MAX5715
 #include "pico/stdio_usb.h"     // USB connection functions
+#include "pico/bootrom.h"       // restart into BOOTSEL mode from software
+#include "hardware/sync.h"      // briefly disable interrupts
+#include <math.h>               // sqrtf, expf
+#include <string.h>             // strcmp, strtok
+#include <stdlib.h>             // strtof
+#include <stdarg.h>             // printf-style function arguments
 // also include our custom I2C PIO library
 #include "pio_i2c.h"
 
@@ -40,20 +50,8 @@
 #define FDC2112_REG_DRIVE_CURRENT_CH0 0x1e
 #define FDC2112_REG_MANUFACTURER_ID 0x7e
 #define FDC2112_REG_DEVICE_ID 0x7f
-
-typedef struct {
-    // store four capacitance values for now
-    int16_t data0;
-    int16_t data1;
-    int16_t data2;
-    int16_t data3;
-    // store four voltages
-    float hv0;
-    float hv1;
-    float hv2;
-    float hv3;
-} levitation_state_t;
-queue_t data_queue;
+// how long each measurement takes (see fdc2112_startup): (RCOUNT*16+4)/21.7MHz
+#define FDC2112_RCOUNT 0x0080
 
 // write a 16-bit value to the given register
 void fdc2112_write_register(PIO pio, uint sm, uint8_t reg, uint16_t data){
@@ -145,8 +143,14 @@ static void fdc2112_startup(PIO pio, uint sm){
     // (Note the minimum is RCOUNT>8, which we satisfy; see page 13)
     //
     // (but register map on page 25 says min is 0x0100 or 0x0080?)
+    //
+    // UPDATE: the main loop only reads the sensor once every 150us, so a
+    // 25us measurement wastes most of that time. For the PD controller we
+    // use a longer measurement instead, RCOUNT=0x80 (about 95us, still
+    // shorter than one loop), which gives roughly 4x finer readings.
     //fdc2112_write_register(pio, sm, FDC2112_REG_RCOUNT_CH0, 0x0040);
-    fdc2112_write_register(pio, sm, FDC2112_REG_RCOUNT_CH0, 0x0021);
+    //fdc2112_write_register(pio, sm, FDC2112_REG_RCOUNT_CH0, 0x0021);
+    fdc2112_write_register(pio, sm, FDC2112_REG_RCOUNT_CH0, FDC2112_RCOUNT);
     // determines the sensor activation time
     // must have settlecount > 3
     fdc2112_write_register(pio, sm, FDC2112_REG_SETTLECOUNT_CH0, 0x000a);
@@ -365,28 +369,310 @@ void HVAWG_write_voltage(float V1, float V2, float V3, float V4){
     HVAWG_write_count(value1, value2, value3, value4);
 }
 
-// ===========================================================================
-// ===========================================================================
-// ========== Main code ======================================================
-// ===========================================================================
-// ===========================================================================
-// (This section contains the main function.)
+// Set all four high voltage outputs to the same voltage.
+// (Only talks to the DAC when the value actually changes.)
+static bool hv_ready = false;          // true once SPI and the DAC are set up
+static uint hv_last_code = 0xffffffff; // forces the first DAC write
+static void HVAWG_write_all(float V){
+    uint code = (uint)(V/66.7f/4.096f*4096.0f + 0.5f);
+    if(code != hv_last_code){
+        HVAWG_write_count(code, code, code, code);
+        hv_last_code = code;
+    }
+}
 
-// We'll run this function on the second microcontroller core.
-// It will simply, in an infinite loop, print data values out over USB serial.
-// - This helps because printing over USB takes time (maybe 20us per printf)
-// - If we put this in the main sensor read loop it would mess with the timing
-// - So put it in the second core instead
-// - (though it still adds a little bit of jitter to the main loop somehow,
-//    as determined by measuring I2C and high voltage on oscilloscope,
-//    possibly due to passing data between cores, but the jitter is small
-//    enough to be manageable)
-void core2_main(){
+// Set all high voltage outputs to 0V right now, no matter what the rest of
+// the program is doing. Used just before restarting into BOOTSEL mode.
+// (Safe to call from an interrupt, e.g., from the USB code.)
+static void HVAWG_force_zero(){
+    if(!hv_ready){ return; }
+    uint32_t irq_state = save_and_disable_interrupts();
+    // if the main loop was in the middle of sending a command, let the byte
+    // currently being sent finish (HVAWG_init_command then starts a new one)
+    for(int i=0; i<10000 && spi_is_busy(spi1); i++){ }
+    HVAWG_write_count(0, 0, 0, 0);
+    hv_last_code = 0;
+    restore_interrupts(irq_state);
+}
+
+// ===========================================================================
+// ===========================================================================
+// ========== Loading new firmware without the BOOTSEL button ================
+// ===========================================================================
+// ===========================================================================
+// To load new firmware, the Pico has to be in BOOTSEL mode. Instead of
+// unplugging USB and holding the BOOTSEL button, this program can be told
+// to restart into BOOTSEL mode over USB. There are three ways:
+//
+// 1. picotool with the -f option ("picotool load -f -x build/levitas.uf2").
+//    This is what "Run Project (USB)" in VS Code does. It works because
+//    pico_enable_stdio_usb() in CMakeLists.txt adds a hidden USB "reset"
+//    interface to this program.
+//
+// 2. Opening the serial port at 1200 baud (and closing it again).
+//    Also provided by pico_enable_stdio_usb().
+//
+// 3. Sending the word "bootsel" over the serial port, e.g., by typing it
+//    into the VS Code serial monitor (see the command list below).
+//
+// The DAC keeps its last output for as long as it has power, including while
+// the Pico sits in BOOTSEL mode. So that high voltage is never left on while
+// new firmware is loaded, all three ways go through the functions below,
+// which set the high voltage to 0V first. (1) and (2) are inside the Pico
+// SDK; the "wrap" lines in CMakeLists.txt make the SDK call these functions
+// instead of its own, and __real_... is the SDK's original function.
+//
+// One complication: the DAC is driven by the control loop on the second
+// core, while (1) and (2) happen on the first core. Two cores must not talk
+// to the DAC at the same time, so in that case we ask the control loop to
+// switch the high voltage off and stop (it checks reboot_requested on every
+// pass), and wait for it to say it has done so.
+static volatile bool reboot_requested = false;        // "control loop: switch high voltage off and stop"
+static volatile bool reboot_hv_is_off = false;        // "done"
+static volatile bool control_loop_running = false;
+static void hv_off_before_reboot(){
+    if(get_core_num() == 1 || !control_loop_running){
+        // we are the control loop (or it hasn't started yet): do it directly
+        HVAWG_force_zero();
+        return;
+    }
+    reboot_requested = true;
+    absolute_time_t give_up_time = make_timeout_time_ms(20); // (the control loop answers within 0.15ms)
+    while(!reboot_hv_is_off && !time_reached(give_up_time)){
+        tight_loop_contents();
+    }
+}
+void __attribute__((noreturn)) __real_rom_reset_usb_boot(uint32_t usb_activity_gpio_pin_mask, uint32_t disable_interface_mask);
+void __attribute__((noreturn)) __wrap_rom_reset_usb_boot(uint32_t usb_activity_gpio_pin_mask, uint32_t disable_interface_mask){
+    hv_off_before_reboot();
+    __real_rom_reset_usb_boot(usb_activity_gpio_pin_mask, disable_interface_mask);
+}
+#if LEVITAS_WRAP_RESET_USB_BOOT_EXTRA // (newer SDK versions use this one; see CMakeLists.txt)
+void __attribute__((noreturn)) __real_rom_reset_usb_boot_extra(int usb_activity_gpio_pin, uint32_t disable_interface_mask, bool usb_activity_gpio_pin_active_low);
+void __attribute__((noreturn)) __wrap_rom_reset_usb_boot_extra(int usb_activity_gpio_pin, uint32_t disable_interface_mask, bool usb_activity_gpio_pin_active_low){
+    hv_off_before_reboot();
+    __real_rom_reset_usb_boot_extra(usb_activity_gpio_pin, disable_interface_mask, usb_activity_gpio_pin_active_low);
+}
+#endif
+
+// ===========================================================================
+// ===========================================================================
+// ========== Settings =======================================================
+// ===========================================================================
+// ===========================================================================
+
+// Length of one pass of the main loop (read sensors, compute, set voltage).
+// WARNING: THE MINIMUM LOOP TIME IS FIXED BY CAPACITIVE SENSOR READS AND
+// HIGH VOLTAGE OUTPUTS. SETTING A LOWER LOOP TIME HERE WON'T DO ANYTHING.
+// (the "status" command reports how many loops ran late)
+#define LOOP_TIME_US 150
+#define LOOP_DT (LOOP_TIME_US*1e-6f) // same, in seconds
+#define MS_TO_LOOPS(ms) ((uint32_t)((ms)*1000/LOOP_TIME_US))
+
+// The program never commands more than this voltage, whatever it is told.
+#define HV_ABS_MAX_V 240.0f
+
+// ----- sensor reading clean-up -----
+// readings above this are failed reads (the sensor returns 0x0fff)
+#define SENSOR_INVALID_ABOVE 0x07d0
+// a reading that jumps by more than this many counts in one loop is treated
+// as a glitch and ignored...
+#define SENSOR_SPIKE_COUNTS 40
+// ...unless it happens this many times in a row (then it's a real change)
+#define SENSOR_SPIKE_MAX_RUN 3
+// turn high voltage off if a sensor gives no valid reading for this long
+#define SENSOR_DEAD_LOOPS MS_TO_LOOPS(30)
+
+// ----- calibration ("cal" command) -----
+#define CAL_SETTLE_LOOPS MS_TO_LOOPS(300)  // wait for the mass to settle
+#define CAL_AVERAGE_LOOPS MS_TO_LOOPS(200) // then average readings this long
+// (same two, but at the top stop with full voltage: kept short because the
+// mass tends to stick to the top stop)
+#define CAL_TOP_SETTLE_LOOPS MS_TO_LOOPS(100)
+#define CAL_TOP_AVERAGE_LOOPS MS_TO_LOOPS(100)
+#define CAL_RAMP_V_PER_S 200.0f            // how fast the voltage is ramped
+#define CAL_MOVE_COUNTS 20.0f // (ramp up) mass has left the bottom when the average reading changed this much
+#define CAL_MIN_SPAN 30.0f    // every sensor must change at least this many counts between the two stops
+
+// ----- controller ("start" command) -----
+// how fast the target height moves to a new setpoint (fraction of travel per second)
+#define SETPOINT_SLEW_PER_S 2.0f
+// stop if the mass sits at the top with 0V, or at the bottom with full
+// voltage, for this long (it is probably physically stuck)
+#define STUCK_TOP_LOOPS MS_TO_LOOPS(500)
+#define STUCK_BOTTOM_LOOPS MS_TO_LOOPS(1000)
+
+// ===========================================================================
+// ===========================================================================
+// ========== Communication between the two microcontroller cores ============
+// ===========================================================================
+// ===========================================================================
+// The Pico has two cores. One runs the control loop (control_main) and must
+// never wait for USB. The other does everything USB (usb_main): it prints the
+// data, prints messages, and reads commands typed by the user. They talk
+// through three queues.
+//
+// The control loop is on the second core (core 1) and USB on the first
+// (core 0), not the other way round, because the Pico SDK handles USB
+// interrupts on core 0. With the control loop there too, about 5% of loops
+// were delayed by USB traffic (by up to 0.4ms).
+
+// what the main loop is currently doing (printed as a number in the data)
+enum {
+    MODE_IDLE = 0,   // high voltage off
+    MODE_MANUAL = 1, // fixed voltage set with the "hv" command
+    MODE_CAL = 2,    // calibration in progress
+    MODE_RUN = 3,    // PD controller running
+};
+
+// control core -> USB core: one line of data to print
+typedef struct {
+    uint64_t t_us;    // time of the sensor reading (microseconds since startup)
+    uint16_t data[4]; // four capacitance sensor readings
+    float hv;         // voltage commanded on all four high voltage outputs
+    float z;          // height as a fraction of travel (0=bottom stop, 1=top stop)
+    float z_ref;      // height the controller is aiming for
+    uint8_t mode;     // one of MODE_...
+} telemetry_t;
+queue_t data_queue;
+
+// control core -> USB core: a text message to print (as a "# ..." line)
+typedef struct {
+    char text[120];
+} message_t;
+queue_t message_queue;
+
+// USB core -> control core: a command typed by the user
+enum {
+    CMD_BOOTSEL, CMD_CAL, CMD_START, CMD_STOP, CMD_STATUS, CMD_HV,
+    CMD_SP, CMD_KP, CMD_KD, CMD_V0, CMD_V1, CMD_VMAX, CMD_FC, CMD_STREAM,
+};
+typedef struct {
+    uint8_t id;  // one of CMD_...
+    float value; // the number typed after the command, if any
+} command_t;
+queue_t command_queue;
+
+// List of commands. Each is typed as one line over the USB serial port,
+// e.g. "kp 3.5" (upper or lower case).
+static const struct {
+    const char* name;
+    uint8_t id;
+    bool needs_value;
+    const char* help;
+} COMMANDS[] = {
+    {"bootsel", CMD_BOOTSEL, false, "high voltage off, restart into BOOTSEL mode to load new firmware"},
+    {"cal",     CMD_CAL,     false, "calibrate: find sensor readings with the mass at the bottom and top stops"},
+    {"start",   CMD_START,   false, "start the PD controller (needs cal first)"},
+    {"stop",    CMD_STOP,    false, "high voltage off"},
+    {"status",  CMD_STATUS,  false, "print all settings and calibration values"},
+    {"hv",      CMD_HV,      true,  "apply a fixed voltage to all four outputs, e.g. hv 100 (hv 0 = off)"},
+    {"sp",      CMD_SP,      true,  "setpoint: target height in % of travel (0=bottom stop, 100=top stop)"},
+    {"kp",      CMD_KP,      true,  "proportional gain (force in units of the weight of the mass, per full travel of height error)"},
+    {"kd",      CMD_KD,      true,  "derivative gain (same force units, per full travel per second; i.e. in seconds)"},
+    {"v0",      CMD_V0,      true,  "voltage that balances gravity with the mass at the bottom stop (set by cal)"},
+    {"v1",      CMD_V1,      true,  "voltage that balances gravity with the mass at the top stop (set by cal)"},
+    {"vmax",    CMD_VMAX,    true,  "highest voltage to use (limited to 240)"},
+    {"fc",      CMD_FC,      true,  "cutoff frequency in Hz of the low-pass filter on the height measurement"},
+    {"stream",  CMD_STREAM,  true,  "print every Nth data line (1 = all, 0 = none)"},
+};
+#define NUM_COMMANDS (sizeof(COMMANDS)/sizeof(COMMANDS[0]))
+
+// (control core) queue a message to be printed by the USB core.
+// Used like printf. Does not wait; the message is dropped if the queue is full.
+static void say(const char* format, ...){
+    message_t message;
+    va_list args;
+    va_start(args, format);
+    vsnprintf(message.text, sizeof(message.text), format, args);
+    va_end(args);
+    queue_try_add(&message_queue, &message);
+}
+
+// (USB core) act on one line typed by the user
+static void handle_command_line(char* line){
+    char* name = strtok(line, " \t");
+    char* value = strtok(NULL, " \t");
+    if(name == NULL){ return; }
+    if(strcmp(name, "help") == 0){
+        printf("# commands (type one per line):\n");
+        for(uint i=0; i<NUM_COMMANDS; i++){
+            printf("#   %-7s %s %s\n", COMMANDS[i].name, COMMANDS[i].needs_value ? "<x>" : "   ", COMMANDS[i].help);
+        }
+        printf("# data lines: time_us, 4x sensor reading, 4x voltage, height %%, target height %%, mode\n");
+        printf("#   (mode: 0=idle 1=fixed voltage 2=calibrating 3=PD controller; height is -1 before cal)\n");
+        return;
+    }
+    for(uint i=0; i<NUM_COMMANDS; i++){
+        if(strcmp(name, COMMANDS[i].name) == 0){
+            if(COMMANDS[i].needs_value && value == NULL){
+                printf("# %s needs a number, e.g. \"%s 1\"\n", name, name);
+                return;
+            }
+            command_t command = {COMMANDS[i].id, value ? strtof(value, NULL) : 0.0f};
+            if(!queue_try_add(&command_queue, &command)){
+                printf("# busy, try again\n");
+            }
+            return;
+        }
+    }
+    printf("# unknown command \"%s\" (type help)\n", name);
+}
+
+// (USB core) collect characters received over USB serial into lines.
+// Does not wait: only looks at characters that have already arrived.
+static void check_for_commands(){
+    static char line[48];
+    static uint length = 0;
+    int c;
+    while((c = getchar_timeout_us(0)) != PICO_ERROR_TIMEOUT){
+        if(c == '\r' || c == '\n'){
+            line[length] = 0;
+            length = 0;
+            handle_command_line(line);
+        }else if(length < sizeof(line)-1){
+            if(c >= 'A' && c <= 'Z'){ c += 'a' - 'A'; } // make lower case
+            line[length] = (char)c;
+            length += 1;
+            // "bootsel" works even if the serial monitor doesn't send an
+            // end-of-line after it
+            if(length == 7 && memcmp(line, "bootsel", 7) == 0){
+                line[length] = 0;
+                length = 0;
+                handle_command_line(line);
+            }
+        }else{
+            length = 0; // line too long; throw it away
+        }
+    }
+}
+
+// This function runs on the first microcontroller core (core 0).
+// It will, in an infinite loop, print data and messages out over USB serial
+// and read commands coming in.
+// - Printing over USB takes time (maybe 20us per printf, plus USB interrupts)
+// - If we put this in the sensor read loop it would mess with the timing
+// - So the sensor read loop runs on the other core instead (see control_main)
+static void usb_main(){
+    bool was_connected = false;
     while(true){
-        // get data from main core
-        levitation_state_t datapoint;
-        queue_remove_blocking(&data_queue, &datapoint);
-        // and print to USB:
+        bool did_something = false;
+
+        // greet each program that opens the serial port
+        bool connected = stdio_usb_connected();
+        if(connected && !was_connected){
+            printf("# levitas v1 firmware with PD levitation control. Type help for commands.\n");
+        }
+        was_connected = connected;
+
+        // print messages from the control core
+        message_t message;
+        while(queue_try_remove(&message_queue, &message)){
+            printf("# %s\n", message.text);
+            did_something = true;
+        }
+
+        // print data from the control core:
         // - microseconds of time since program started,
         // - (4x) capacitance sensor data values (as a hexadecimal integer)
         //       (roughly speaking, higher values = lower capacitance,
@@ -400,58 +686,107 @@ void core2_main(){
         //       (note actual value, measured via oscilloscope, might be
         //        slightly different because of rise times, power supply
         //        max current limits, etc; it's good to check)
+        // - height of the mass in % of its travel (-1 before calibration)
+        // - height the controller is aiming for in %
+        // - what the main loop is doing (MODE_... number)
         // WARNING: SENSORS SDA1,2,3,4 CORRESPOND TO HIGH VOLTAGE
         // OUTPUTS HV4,3,2,1 on PCB (NUMBERS ARE BACKWARD) (AND DAC
         // SPI ALSO HAS DIFFERENT WIRING).
+        telemetry_t d;
+        if(queue_try_remove(&data_queue, &d)){
+            // (printed with whole numbers only, e.g. 123.45 as "123" "." "45",
+            // because printf is several times slower with decimal numbers
+            // and could then not keep up with the main loop)
+            int hv = (int)(d.hv*100.0f + 0.5f);          // in 0.01 V
+            int z = (int)lroundf(d.z*10000.0f);          // in 0.01 %
+            int z_ref = (int)(d.z_ref*10000.0f + 0.5f);  // in 0.01 %
+            const char* z_sign = z < 0 ? "-" : "";
+            if(z < 0){ z = -z; }
+            printf("%llu 0x%04x 0x%04x 0x%04x 0x%04x %d.%02d %d.%02d %d.%02d %d.%02d %s%d.%02d %d.%02d %u\n", d.t_us,
+                d.data[0], d.data[1], d.data[2], d.data[3],
+                hv/100, hv%100, hv/100, hv%100, hv/100, hv%100, hv/100, hv%100,
+                z_sign, z/100, z%100, z_ref/100, z_ref%100, d.mode
+            );
+            did_something = true;
+        }
 
+        check_for_commands();
 
-        printf("%llu 0x%04x 0x%04x 0x%04x 0x%04x %f %f %f %f\n", to_us_since_boot(get_absolute_time()), 
-            datapoint.data0,
-            datapoint.data1,
-            datapoint.data2,
-            datapoint.data3,
-            datapoint.hv0,
-            datapoint.hv1,
-            datapoint.hv2,
-            datapoint.hv3
-        );
-        
+        if(!did_something){
+            sleep_us(20);
+        }
     }
 }
 
-// This is the starting point of the entire program,
-// and runs on the main microcontroller core.
-// - starts second core to print data
+// ===========================================================================
+// ===========================================================================
+// ========== Main code ======================================================
+// ===========================================================================
+// ===========================================================================
+// (This section contains the main function.)
+
+static inline float clampf(float x, float low, float high){
+    return x < low ? low : (x > high ? high : x);
+}
+
+// This is the control loop. It runs on the second microcontroller core
+// (core 1; it is started by main() at the bottom of this file).
 // - initializes FDC2112 capacitance sensors
 // - initialize MAX5715 DAC for high voltage output
 // - then runs main loop
 //   - read from capacitance sensors
-//   - optionally set high voltage
-//   - send data to second core to be printed with USB
+//   - work out the height of the mass
+//   - set high voltage (calibration, or PD controller)
+//   - send data to the other core to be printed with USB
 //   - try to run at a fixed frequency
-int main() {
+//
+// High voltage stays at 0V until a command is received over USB. To levitate:
+//   cal      (lifts the mass to the top stop and back to calibrate the sensors)
+//   start    (starts the PD controller)
+//   stop
+//
+// ===== How the PD controller works =====
+// Only the height of the mass is controlled, not its tilt: the same voltage
+// goes to all four electrodes, and the height is the average of the four
+// sensors.
+//
+// The electrodes pull the mass up with a force proportional to
+// (voltage / gap)^2. So the closer the mass gets to the electrodes, the
+// stronger a given voltage pulls: with a fixed voltage the mass either falls
+// or snaps all the way up. The voltage that exactly cancels the weight of the
+// mass is proportional to the gap; we approximate it with a straight line
+// from "v0" at the bottom stop to "v1" at the top stop:
+//   v_weight(z) = v0 + (v1 - v0)*z         (z = height, 0=bottom, 1=top)
+// The controller decides how much upward force it wants, in units of the
+// weight of the mass:
+//   force = 1 + kp*(z_target - z) - kd*(speed of z)
+// (1 = hold the weight; the kp term pushes toward the target height; the kd
+// term brakes the motion) and because force goes as voltage squared, applies
+//   voltage = v_weight(z) * sqrt(force)
+// v0 and v1 are measured by "cal" (the voltages at which the mass leaves the
+// bottom and top stops). They are only approximate (the mass tends to stick
+// to the stops), which mostly shows up as the mass hovering a bit away from
+// the target height; adjust v0/v1 to trim that.
+static void control_main() {
 
-    // Enable printing to whichever outputs are enabled in CMakeLists.txt
-    // (currently only USB over serial)
-    // (print by calling printf function)
-    // USB serial port defaults to 115200 baud
-    stdio_init_all();
+    // set up MAX5715 DAC and set high voltage to zero
+    // (do this first: if the Pico was restarted while high voltage was on,
+    // the DAC is still outputting its old value)
+    spi_init(spi1, 5000*1000);
+    gpio_set_function(HVAWG_SCLK_PIN, GPIO_FUNC_SPI);
+    gpio_set_function(HVAWG_MOSI_PIN, GPIO_FUNC_SPI);
+    gpio_init(HVAWG_CS_PIN);
+    gpio_set_dir(HVAWG_CS_PIN, GPIO_OUT);
+    gpio_put(HVAWG_CS_PIN, 0); // enable MAX5715 SPI (its CS pin is active low)
+    sleep_ms(1);
+    HVAWG_reset();
+    HVAWG_write_voltage(0,0,0,0);
+    hv_ready = true;
 
-    // Launch second microcontroller core, which will print data over USB.
-    // We'll use a queue datastructure to transfer data between the main
-    // and second microcontroller cores: the main core puts data into the
-    // queue, and the second core takes it out.
-    // The queue doesn't need to be big (here we have it only hold 2 things
-    // at once to avoid unexpected delays if something weird happens); it's
-    // only necessary as a thread-safe way to share data.
-    queue_init(&data_queue, sizeof(levitation_state_t), 2);
-    multicore_launch_core1(core2_main);
-
-    // set up LED
-    // (in case we want to do anything with it, though right now we don't)
+    // set up LED (on while high voltage is on)
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
-    gpio_put(PICO_DEFAULT_LED_PIN, 1);
+    gpio_put(PICO_DEFAULT_LED_PIN, 0);
 
     // set up FDC2112 sensors
     PIO pio_0 = pio0; // choose a PIO
@@ -461,7 +796,7 @@ int main() {
     uint sm2 = 2; // choose PIO state machine
     uint sm3 = 3; // choose PIO state machine
     uint offset0 = pio_add_program(pio_0, &pio_i2c_program); // load program into PIO memory, return instruction memory offset it is loaded at
-    
+
     pio_i2c_program_init(pio_0, sm0, offset0, 4, 5); // start PIO state machine at given instruction offset with given SDA and SCL pin
     pio_i2c_program_init(pio_0, sm1, offset0, 6, 7); // start PIO state machine at given instruction offset with given SDA and SCL pin
     pio_i2c_program_init(pio_0, sm2, offset0, 8, 9); // start PIO state machine at given instruction offset with given SDA and SCL pin
@@ -474,7 +809,7 @@ int main() {
     fdc2112_startup(pio_0, sm1);
     fdc2112_startup(pio_0, sm2);
     fdc2112_startup(pio_0, sm3);
-    
+
     // we'll use this array to store data we read from the sensors
     uint16_t result0[] = {0x00, 0x00, 0x00, 0x00};
 
@@ -486,175 +821,389 @@ int main() {
     // read data more quickly (via the read_register_nowrite() function).
     // However, we still need to do (1) at some point before that. This
     // function call does both (1) and (2).
-    
+
     fdc2112_read_register_4(pio0, sm0, sm1, sm2, sm3, FDC2112_REG_DATA_CH0, result0);
 
-    // set up MAX5715 DAC
-    spi_init(spi1, 5000*1000);
-    gpio_set_function(HVAWG_SCLK_PIN, GPIO_FUNC_SPI);
-    gpio_set_function(HVAWG_MOSI_PIN, GPIO_FUNC_SPI);
-    gpio_init(HVAWG_CS_PIN);
-    gpio_set_dir(HVAWG_CS_PIN, GPIO_OUT);
-    gpio_put(HVAWG_CS_PIN, 0); // enable MAX5715 SPI (its CS pin is active low)
-    sleep_ms(250); // wait at least 200us for DAC to initialize
-    HVAWG_reset(); // send configuration information
-    // start by applying this voltage
+    // In case the DAC was still powering up the first time (it needs 200us
+    // after power is applied), configure it again and set high voltage to zero.
+    HVAWG_reset();
     HVAWG_write_voltage(0,0,0,0);
+    hv_last_code = 0;
 
     // We'll use these variables to keep main loop running
     // at a fixed frequency (determined by LOOP_TIME_US).
-    // WARNING: THE MINIMUM LOOP TIME IS FIXED BY CAPACITIVE SENSOR
-    // READS AND HIGH VOLTAGE OUTPUTS. SETTING A LOWER LOOP TIME HERE
-    // WON'T DO ANYTHING. CONFIRM IT'S ACTUALLY WORKING VIA
-    // OSCILLOSCOPE (E.G., ON I2C SDA PINS).
-    const uint64_t LOOP_TIME_US = 150; // try to make loop this long on average
     absolute_time_t loop_start_time = get_absolute_time();
+    uint32_t late_loops = 0; // how many loops took too long (for "status")
+    uint32_t work_us_max = 0; // longest and total time spent working in a loop
+    uint64_t work_us_sum = 0; // (i.e. not counting the wait at the end)
+    uint32_t work_loops = 0;
 
-    // Some variables to keep track of what we've set the
-    // high voltage to and how often to update it
-    float hv0 = 0;
-    float hv1 = 0;
-    float hv2 = 0;
-    float hv3 = 0;
-    bool high = false;
-    absolute_time_t hv_start_time = get_absolute_time();
-    int pulse_length = 100; //stores on/off pulse length
-    float step_vol = 0;
-    bool startup = true;
+    // ===== settings that can be changed with commands =====
+    // Starting gains, worked out for a mass of about 100mg that can travel
+    // about L=80um (the gap to the electrodes). With the control law above,
+    // the height z (as a fraction of L) behaves like a mass on a spring:
+    //   z'' + (kd*g/L + air damping) z' + (kp*g/L) z = (kp*g/L) z_target
+    // where g=9.81m/s^2, so g/L = 123000 1/s^2. (The mass itself cancels out
+    // because the force is in units of its weight.)
+    // - kp=5 gives a natural frequency of sqrt(kp*g/L) = 780rad/s = 125Hz,
+    //   well below the 6.7kHz loop rate
+    // - kd=0.010 gives a damping ratio of kd*(g/L)/(2*780) = 0.8 even with
+    //   no help from air damping
+    // If the travel L is really shorter, both act stronger in proportion
+    // (e.g., half the travel: use half the kp and kd for the same behavior).
+    float kp = 5.0f;        // proportional gain
+    float kd = 0.010f;      // derivative gain
+    float setpoint = 0.5f;  // target height (fraction of travel)
+    float v0 = 210.0f;      // voltage balancing gravity at the bottom stop
+    float v1 = 10.0f;       // voltage balancing gravity at the top stop
+    float vmax = HV_ABS_MAX_V; // highest voltage to use
+    float fc = 1000.0f;     // low-pass filter cutoff frequency (Hz) (well above the 125Hz above so the filter delay doesn't upset the controller)
+    float filter_alpha = 1.0f - expf(-2.0f*3.14159265f*fc*LOOP_DT);
+    uint32_t stream_every = 1; // print every Nth data line
 
-    // Some variables to compare hardcoded capacitance values to
-    // known min/max capacitance values to estimate position
-    // WARNING: THESE TEND TO DRIFT OVER TIME AND NEED RECALIBRATION
-    // uint16_t top_values[] = {0x0588, 0x06e2, 0x06dd, 0x0655}; 
-    // uint16_t bottom_values[] = {0x050b, 0x065b, 0x0645, 0x05a6}; 
-    //TODO: linear extrapolation
-    // uint16_t middle_values[] = {0,0,0,0};
-    // for(int i=0; i<4; i++){
-    //     middle_values[i] = (top_values[i]+bottom_values[i])/2;
-    // }
+    // ===== sensor state =====
+    uint16_t good[4] = {0, 0, 0, 0};       // last accepted reading of each sensor
+    uint32_t spike_run[4] = {0, 0, 0, 0};  // how many jumps in a row were ignored
+    uint32_t invalid_run[4] = {0, 0, 0, 0};// how many failed reads in a row
+    uint32_t spike_count = 0;              // total ignored readings (for "status")
+    bool have_reading = false;
+    float filtered[4] = {0, 0, 0, 0};      // low-pass filtered readings
 
-    uint16_t oldresult0[] = {0x00, 0x00, 0x00, 0x00};
+    // ===== calibration =====
+    bool cal_valid = false;
+    float cal_bottom[4] = {0, 0, 0, 0}; // reading with mass on the bottom stop
+    float cal_span[4] = {1, 1, 1, 1};   // how much the reading drops going to the top stop
+    // progress of the "cal" command
+    enum {CAL_REST_SETTLE, CAL_REST_AVERAGE, CAL_RAMP_UP, CAL_TOP_SETTLE,
+          CAL_TOP_AVERAGE, CAL_RAMP_DOWN, CAL_END_SETTLE};
+    int cal_step = CAL_REST_SETTLE;
+    uint32_t cal_loops = 0;         // loops spent in this step
+    float cal_sum[4] = {0, 0, 0, 0};
+    float cal_lift_v = 0;           // voltage at which the mass left the bottom stop
+    float cal_release_v = 0;        // voltage at which the mass left the top stop
+    bool cal_lift_seen = false;
+    bool cal_release_seen = false;
 
-    // ===== linear ramp settings =====
-    const float    RAMP_START_V       = 0.0f;
-    const float    RAMP_END_V         = 180.0f;
-    const float    RAMP_RATE          = 40.0f;    // change ramp speed
-    const uint32_t RAMP_DELAY_MS      = 10000;   // buffer time after USB connection
-    bool ramp_started = false;
-    absolute_time_t ramp_t0 = get_absolute_time();
-    uint last_code = 0xFFFFFFFF;                 // forces the first DAC write
+    // ===== controller state =====
+    uint8_t mode = MODE_IDLE;
+    float hv = 0;            // voltage we are applying
+    float manual_v = 0;      // voltage for MODE_MANUAL
+    float z = -0.01f;        // height, fraction of travel (-0.01 = not calibrated, printed as -1)
+    float z_previous = 0;
+    float z_speed = 0;       // filtered speed of z (fraction of travel per second)
+    float z_target = 0;      // moves smoothly toward setpoint
+    uint32_t stuck_top_loops = 0;
+    uint32_t stuck_bottom_loops = 0;
+    uint32_t loop_count = 0;
 
-    // ===== square pulse settings =====
-    const float hi = 220.0f;
+    control_loop_running = true;
     while(true){
 
-        // ===== in case you want to blink LEDs =====
-        gpio_put(PICO_DEFAULT_LED_PIN, true);
-        gpio_put(PICO_DEFAULT_LED_PIN, false);
+        // ===== about to restart into BOOTSEL mode? =====
+        // (see hv_off_before_reboot)
+        if(reboot_requested){
+            HVAWG_force_zero();
+            reboot_hv_is_off = true;
+            while(true){ tight_loop_contents(); } // wait for the restart
+        }
 
         // ===== read capacitance sensors =====
         // WARNING: SENSORS SDA1,2,3,4 CORRESPOND TO HIGH VOLTAGE
         // OUTPUTS HV4,3,2,1 on PCB (NUMBERS ARE BACKWARD) (AND DAC
         // SPI ALSO HAS DIFFERENT WIRING).
         // read quickly from the chip registers
-        for(int i=0; i<4; i++) {
-            oldresult0[i] = result0[i];
-        }
-
+        uint64_t t_loop_begin_us = to_us_since_boot(get_absolute_time());
         fdc2112_read_register_nowrite_4(pio_0, sm0, sm1, sm2, sm3, result0);
-        //discard 0x0fff values
+        uint64_t t_us = to_us_since_boot(get_absolute_time());
+
+        // throw away bad readings (keep the previous good one instead):
+        // failed reads, and single readings that jump implausibly far
+        bool sensor_dead = false;
         for(int i=0; i<4; i++){
-            //if(result[i] == 0x0fff){result[i] = oldresult[i];} //omit
-            if(result0[i] > 0x07d0){result0[i] = oldresult0[i];}
+            uint16_t r = result0[i];
+            if(r > SENSOR_INVALID_ABOVE){
+                invalid_run[i] += 1;
+                if(invalid_run[i] > SENSOR_DEAD_LOOPS){ sensor_dead = true; }
+                continue;
+            }
+            invalid_run[i] = 0;
+            int jump = (int)r - (int)good[i];
+            if(jump < 0){ jump = -jump; }
+            if(have_reading && jump > SENSOR_SPIKE_COUNTS && spike_run[i] < SENSOR_SPIKE_MAX_RUN){
+                spike_run[i] += 1;
+                spike_count += 1;
+                continue;
+            }
+            spike_run[i] = 0;
+            good[i] = r;
+        }
+        if(!have_reading){
+            for(int i=0; i<4; i++){ filtered[i] = good[i]; }
+            have_reading = true;
         }
 
-        // =============================
-        // ===== High voltage code =====
-        // =============================
-        // Uncomment only one of #1, #2, #3, #4
-
-        // ===== output high voltage #1: do nothing =====
-        // keep voltage at 0.
-        //HVAWG_write_voltage(0,0,0,0);
-
-        // ===== output high voltage #2: square wave =====
-        // enable then disable high voltage slowly.
-        // useful for testing whether movement works at all.
-
-        // absolute_time_t hv_now_time = get_absolute_time();
-        // if(hv_now_time > delayed_by_ms(hv_start_time, 1000)){
-        //     high = !high;
-        //     hv0 = high?hi:0;
-        //     hv1 = high?hi:0;
-        //     hv2 = high?hi:0;
-        //     hv3 = high?hi:0;
-        //     HVAWG_write_voltage(hv0,hv1,hv2,hv3);
-        //     gpio_put(PICO_DEFAULT_LED_PIN, high); // also blink LED
-        //     hv_start_time = hv_now_time;
-        // }
-
-        // ===== output high voltage #3: linear ramp =====
-        // triangle waveform
-
-        absolute_time_t now = get_absolute_time();
-        bool connected = stdio_usb_connected();
-
-        if (connected && !ramp_started) {
-            ramp_t0 = delayed_by_ms(now, RAMP_DELAY_MS); //set the start time
-            ramp_started = true;
+        // low-pass filter the readings, then work out height and speed
+        for(int i=0; i<4; i++){
+            filtered[i] += filter_alpha*((float)good[i] - filtered[i]);
         }
-        if (!connected) { //reset on disconnect
-            ramp_started = false;
+        if(cal_valid){
+            z = 0;
+            for(int i=0; i<4; i++){
+                z += 0.25f*(cal_bottom[i] - filtered[i])/cal_span[i];
+            }
+            z_speed += filter_alpha*((z - z_previous)/LOOP_DT - z_speed);
+            z_previous = z;
+        }else{
+            z = -0.01f;
+            z_speed = 0;
         }
 
-        float v = RAMP_START_V;
-        if (ramp_started && time_reached(ramp_t0)) {
-            // length of one ramp (up or down) in microseconds
-            const int64_t half_us = (int64_t)((RAMP_END_V - RAMP_START_V) / RAMP_RATE * 1e6f);
-            // position within the current period (integer math so it
-            // stays accurate no matter how long the program runs)
-            int64_t t_us = absolute_time_diff_us(ramp_t0, now) % (2 * half_us);
-            if (t_us < half_us) {
-                v = RAMP_START_V + RAMP_RATE * (t_us / 1e6f);              // rising
-            } else {
-                v = RAMP_END_V - RAMP_RATE * ((t_us - half_us) / 1e6f);    // falling
+        // ===== handle one command from the user, if there is one =====
+        command_t command;
+        if(queue_try_remove(&command_queue, &command)){
+            float x = command.value;
+            switch(command.id){
+            case CMD_BOOTSEL:
+                HVAWG_force_zero();
+                say("high voltage off, restarting into BOOTSEL mode");
+                sleep_ms(100); // give the message time to be sent
+                // (0, 0) = no activity LED, keep both USB drive and picotool interfaces
+                reset_usb_boot(0, 0); // does not return
+                break;
+            case CMD_STOP:
+                if(mode == MODE_CAL){ cal_valid = false; } // unfinished calibration
+                mode = MODE_IDLE;
+                say("stopped, high voltage off");
+                break;
+            case CMD_HV:
+                if(mode == MODE_CAL || mode == MODE_RUN){
+                    say("busy: type stop first");
+                }else{
+                    manual_v = clampf(x, 0, vmax);
+                    mode = manual_v > 0 ? MODE_MANUAL : MODE_IDLE;
+                    say("fixed voltage %.1f V", manual_v);
+                }
+                break;
+            case CMD_CAL:
+                if(mode == MODE_RUN){
+                    say("busy: type stop first");
+                }else{
+                    mode = MODE_CAL;
+                    cal_valid = false;
+                    cal_step = CAL_REST_SETTLE;
+                    cal_loops = 0;
+                    say("calibrating (takes about 3 seconds)...");
+                }
+                break;
+            case CMD_START:
+                if(!cal_valid){
+                    say("not calibrated: type cal first");
+                }else if(mode == MODE_CAL){
+                    say("busy: calibration still running");
+                }else{
+                    mode = MODE_RUN;
+                    z_target = clampf(z, 0, 1); // start from where the mass is
+                    stuck_top_loops = 0;
+                    stuck_bottom_loops = 0;
+                    say("PD controller started: sp=%.1f%% kp=%.3f kd=%.5f v0=%.1f v1=%.1f", setpoint*100, kp, kd, v0, v1);
+                }
+                break;
+            case CMD_SP: setpoint = clampf(x/100.0f, 0.02f, 0.98f); say("sp = %.1f %%", setpoint*100); break;
+            case CMD_KP: kp = x < 0 ? 0 : x; say("kp = %.3f", kp); break;
+            case CMD_KD: kd = x < 0 ? 0 : x; say("kd = %.5f", kd); break;
+            case CMD_V0: v0 = clampf(x, 0, HV_ABS_MAX_V); say("v0 = %.1f V", v0); break;
+            case CMD_V1: v1 = clampf(x, 0, HV_ABS_MAX_V); say("v1 = %.1f V", v1); break;
+            case CMD_VMAX: vmax = clampf(x, 0, HV_ABS_MAX_V); say("vmax = %.1f V", vmax); break;
+            case CMD_FC:
+                fc = clampf(x, 1.0f, 0.5e6f/LOOP_TIME_US); // at most half the loop frequency
+                filter_alpha = 1.0f - expf(-2.0f*3.14159265f*fc*LOOP_DT);
+                say("fc = %.0f Hz", fc);
+                break;
+            case CMD_STREAM: stream_every = x < 0 ? 0 : (uint32_t)x; say("stream = %u", (unsigned)stream_every); break;
+            case CMD_STATUS:
+                say("mode=%u (0=idle 1=fixed voltage 2=calibrating 3=PD) hv=%.1f V  height=%.1f %%", mode, hv, z*100);
+                say("sp=%.1f %%  kp=%.3f  kd=%.5f  v0=%.1f V  v1=%.1f V  vmax=%.1f V  fc=%.0f Hz  stream=%u",
+                    setpoint*100, kp, kd, v0, v1, vmax, fc, (unsigned)stream_every);
+                if(cal_valid){
+                    say("cal: bottom = %.1f %.1f %.1f %.1f counts", cal_bottom[0], cal_bottom[1], cal_bottom[2], cal_bottom[3]);
+                    say("cal: travel = %.1f %.1f %.1f %.1f counts", cal_span[0], cal_span[1], cal_span[2], cal_span[3]);
+                }else{
+                    say("cal: not calibrated");
+                }
+                say("loop=%u us (work per loop since last status: average %u us, longest %u us)", (unsigned)LOOP_TIME_US,
+                    (unsigned)(work_loops ? work_us_sum/work_loops : 0), (unsigned)work_us_max);
+                say("late loops=%u  ignored sensor readings=%u", (unsigned)late_loops, (unsigned)spike_count);
+                work_us_max = 0; work_us_sum = 0; work_loops = 0;
+                break;
             }
         }
 
-        uint code = (uint)(v / 66.7f / 4.096f * 4096.0f + 0.5f);
-        if (code != last_code) {// only touch SPI when the output changes
-            HVAWG_write_count(code, code, code, code);
-            last_code = code;
+        // ===== safety checks =====
+        if(mode != MODE_IDLE && !stdio_usb_connected()){
+            // nobody is listening on USB any more: don't leave high voltage on
+            if(mode == MODE_CAL){ cal_valid = false; }
+            mode = MODE_IDLE;
         }
-        hv0 = hv1 = hv2 = hv3 = v; 
-
-
-        // ===== output high voltage #4: bang-bang controller=====
-        // WARNING: REQUIRES HARDCODED MIN/MAX CAPACITANCE VALUES (SEE EARLIER
-        // CODE ABOVE), WHICH NEED TO BE RECALIBRATED FREQUENTLY
-        // naive bang-bang controller to try to keep rotor levitated in middle
-        // todo: improve this (doesn't even have hysterisis so switching speed is too fast!)
-        /*
-        uint32_t sum_current = result[0]+result[1]+result[2]+result[3];
-        uint32_t sum_middle = middle_values[0]+middle_values[1]+middle_values[2]+middle_values[3];
-        if(sum_current > sum_middle){ // cap sensors return a high value, which means capacitance is low, which means rotor is close to stator electrodes
-            hv0 = 240;
-            hv1 = 240;
-            hv2 = 240;
-            hv3 = 240;
-        }else{ // rotor is closer to capacitive sensors
-            hv0 = 0;
-            hv1 = 0;
-            hv2 = 0;
-            hv3 = 0;
+        if(mode != MODE_IDLE && sensor_dead){
+            if(mode == MODE_CAL){ cal_valid = false; }
+            mode = MODE_IDLE;
+            say("ERROR: a sensor stopped giving readings (last: 0x%04x 0x%04x 0x%04x 0x%04x). High voltage off.",
+                result0[0], result0[1], result0[2], result0[3]);
         }
-        HVAWG_write_voltage(hv0,hv1,hv2,hv3);
-        */
 
-        // send data to second core for printing
-        levitation_state_t entry = {result0[0], result0[1], result0[2], result0[3], hv0, hv1, hv2, hv3};
-        // note: this causes significant (maybe ~20us) timing jitter
-        queue_try_add(&data_queue, &entry); // nonblocking
+        // ===== decide the high voltage =====
+        if(mode == MODE_IDLE){
+            hv = 0;
+
+        }else if(mode == MODE_MANUAL){
+            hv = manual_v;
+
+        }else if(mode == MODE_CAL){
+            // Calibration: find what each sensor reads with the mass on the
+            // bottom stop (0V) and on the top stop (full voltage), and at
+            // what voltage it leaves each stop.
+            cal_loops += 1;
+            float average_drop = 0.25f*((cal_bottom[0]-filtered[0]) + (cal_bottom[1]-filtered[1])
+                                      + (cal_bottom[2]-filtered[2]) + (cal_bottom[3]-filtered[3]));
+            switch(cal_step){
+            case CAL_REST_SETTLE: // 0V, let the mass settle on the bottom stop
+                hv = 0;
+                if(cal_loops >= CAL_SETTLE_LOOPS){
+                    for(int i=0; i<4; i++){ cal_sum[i] = 0; }
+                    cal_step = CAL_REST_AVERAGE; cal_loops = 0;
+                }
+                break;
+            case CAL_REST_AVERAGE: // average the readings at the bottom stop
+                hv = 0;
+                for(int i=0; i<4; i++){ cal_sum[i] += good[i]; }
+                if(cal_loops >= CAL_AVERAGE_LOOPS){
+                    for(int i=0; i<4; i++){ cal_bottom[i] = cal_sum[i]/cal_loops; }
+                    cal_lift_seen = false;
+                    cal_step = CAL_RAMP_UP; cal_loops = 0;
+                }
+                break;
+            case CAL_RAMP_UP: // raise voltage slowly, note when the mass lifts off
+                hv += CAL_RAMP_V_PER_S*LOOP_DT;
+                if(!cal_lift_seen && average_drop > CAL_MOVE_COUNTS){
+                    cal_lift_seen = true;
+                    cal_lift_v = hv;
+                }
+                if(hv >= vmax){
+                    hv = vmax;
+                    cal_step = CAL_TOP_SETTLE; cal_loops = 0;
+                }
+                break;
+            case CAL_TOP_SETTLE: // full voltage, let the mass settle on the top stop
+                hv = vmax;
+                if(cal_loops >= CAL_TOP_SETTLE_LOOPS){
+                    for(int i=0; i<4; i++){ cal_sum[i] = 0; }
+                    cal_step = CAL_TOP_AVERAGE; cal_loops = 0;
+                }
+                break;
+            case CAL_TOP_AVERAGE: // average the readings at the top stop
+                hv = vmax;
+                for(int i=0; i<4; i++){ cal_sum[i] += good[i]; }
+                if(cal_loops >= CAL_TOP_AVERAGE_LOOPS){
+                    bool moved = true;
+                    for(int i=0; i<4; i++){
+                        cal_span[i] = cal_bottom[i] - cal_sum[i]/cal_loops;
+                        if(cal_span[i] < CAL_MIN_SPAN){ moved = false; }
+                    }
+                    if(!moved){
+                        say("CAL FAILED: the mass did not move at %.0f V (is it stuck?). High voltage off.", vmax);
+                        say("  sensor change bottom->top = %.1f %.1f %.1f %.1f counts (need at least %.0f each)",
+                            cal_span[0], cal_span[1], cal_span[2], cal_span[3], CAL_MIN_SPAN);
+                        mode = MODE_IDLE;
+                        hv = 0;
+                    }else{
+                        cal_valid = true; // (height is now available for the next steps)
+                        z_previous = 1;
+                        cal_release_seen = false;
+                        cal_step = CAL_RAMP_DOWN; cal_loops = 0;
+                    }
+                }
+                break;
+            case CAL_RAMP_DOWN: // lower voltage slowly, note when the mass drops
+                hv -= CAL_RAMP_V_PER_S*LOOP_DT;
+                if(!cal_release_seen && z < 0.5f){
+                    cal_release_seen = true;
+                    cal_release_v = hv > 0 ? hv : 0;
+                }
+                if(hv <= 0){
+                    hv = 0;
+                    cal_step = CAL_END_SETTLE; cal_loops = 0;
+                }
+                break;
+            case CAL_END_SETTLE: // 0V, check the mass came back down
+                hv = 0;
+                if(cal_loops >= CAL_SETTLE_LOOPS){
+                    if(cal_lift_seen){ v0 = cal_lift_v; }
+                    v1 = cal_release_seen ? cal_release_v : 0;
+                    say("cal done. bottom = %.1f %.1f %.1f %.1f counts", cal_bottom[0], cal_bottom[1], cal_bottom[2], cal_bottom[3]);
+                    say("  travel = %.1f %.1f %.1f %.1f counts", cal_span[0], cal_span[1], cal_span[2], cal_span[3]);
+                    say("  left bottom stop at v0 = %.1f V, left top stop at v1 = %.1f V", v0, v1);
+                    float smallest = cal_span[0], largest = cal_span[0];
+                    for(int i=1; i<4; i++){
+                        if(cal_span[i] < smallest){ smallest = cal_span[i]; }
+                        if(cal_span[i] > largest){ largest = cal_span[i]; }
+                    }
+                    if(smallest < 0.5f*largest){
+                        say("  WARNING: travel is very uneven between sensors; the mass may be tilted or partly stuck");
+                    }
+                    if(z > 0.2f){
+                        say("  WARNING: the mass did not come back down (height %.0f %% at 0 V); it may be stuck at the top", z*100);
+                    }
+                    mode = MODE_IDLE;
+                }
+                break;
+            }
+
+        }else if(mode == MODE_RUN){
+            // PD controller (see explanation above main())
+            // move the target height smoothly toward the setpoint
+            float step = SETPOINT_SLEW_PER_S*LOOP_DT;
+            z_target += clampf(setpoint - z_target, -step, step);
+            // upward force wanted, in units of the weight of the mass
+            float force = 1.0f + kp*(z_target - z) - kd*z_speed;
+            if(force < 0){ force = 0; } // electrodes can only pull up
+            // voltage that would just hold the weight at this height...
+            float v_weight = v0 + (v1 - v0)*clampf(z, 0, 1);
+            // ...scaled for the force wanted (force goes as voltage squared)
+            hv = v_weight*sqrtf(force);
+
+            // give up if the mass looks physically stuck
+            stuck_top_loops = (z > 0.9f && hv < 1.0f) ? stuck_top_loops + 1 : 0;
+            stuck_bottom_loops = (z < 0.1f && hv >= vmax) ? stuck_bottom_loops + 1 : 0;
+            if(stuck_top_loops > STUCK_TOP_LOOPS){
+                say("STOPPED: the mass stays at the top stop (height %.0f %%) with 0 V. It is probably stuck.", z*100);
+                mode = MODE_IDLE;
+                hv = 0;
+            }else if(stuck_bottom_loops > STUCK_BOTTOM_LOOPS){
+                say("STOPPED: the mass stays at the bottom stop (height %.0f %%) with %.0f V. It is probably stuck.", z*100, vmax);
+                mode = MODE_IDLE;
+                hv = 0;
+            }
+        }
+
+        // ===== output the high voltage =====
+        hv = clampf(hv, 0, vmax);
+        HVAWG_write_all(hv);
+        gpio_put(PICO_DEFAULT_LED_PIN, hv > 0);
+
+        // ===== send data to the other core for printing =====
+        loop_count += 1;
+        if(stream_every > 0 && loop_count % stream_every == 0){
+            telemetry_t entry = {t_us, {result0[0], result0[1], result0[2], result0[3]}, hv, z, z_target, mode};
+            if(mode != MODE_RUN){ entry.z_ref = setpoint; }
+            // note: this causes significant (maybe ~20us) timing jitter
+            queue_try_add(&data_queue, &entry); // nonblocking
+        }
+
+        // (keep statistics on how long the work in each loop takes)
+        uint32_t work_us = (uint32_t)(to_us_since_boot(get_absolute_time()) - t_loop_begin_us);
+        if(work_us > work_us_max){ work_us_max = work_us; }
+        work_us_sum += work_us;
+        work_loops += 1;
 
         // ===== TIMING: DO NOT EDIT THIS SECTION =====
         // Loop length will vary slightly due to multicore communication,
@@ -667,11 +1216,39 @@ int main() {
             // more, we will have desynchronized from our loop time count
             // and should restart as quickly as possible.
             loop_start_time = now_time;
+            late_loops += 1;
         }
-        sleep_until(loop_start_time); // takes absolute_time_t
+        // (busy_wait_until instead of sleep_until: sleep_until relies on a
+        // timer interrupt on the other core, which USB traffic can delay)
+        busy_wait_until(loop_start_time); // takes absolute_time_t
         // ===== END TIMING SECTION =====
     }
+}
+
+// This is the starting point of the entire program (on core 0).
+// - sets up USB
+// - starts the control loop on the second microcontroller core
+// - then prints data and reads commands forever
+int main() {
+
+    // Enable printing to whichever outputs are enabled in CMakeLists.txt
+    // (currently only USB over serial)
+    // (print by calling printf function)
+    // USB serial port defaults to 115200 baud
+    stdio_init_all();
+
+    // We'll use queue datastructures to transfer data between the two
+    // microcontroller cores (see above). The data queue doesn't need to be
+    // big (to avoid unexpected delays if something weird happens); it's
+    // only necessary as a thread-safe way to share data.
+    queue_init(&data_queue, sizeof(telemetry_t), 2);
+    queue_init(&message_queue, sizeof(message_t), 24);
+    queue_init(&command_queue, sizeof(command_t), 4);
+
+    // Launch the control loop on the second microcontroller core...
+    multicore_launch_core1(control_main);
+    // ...and do the USB printing and command reading on this one.
+    usb_main();
 
     return 0;
 }
-

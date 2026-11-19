@@ -89,7 +89,25 @@ target_link_libraries(levitas
     pico_multicore
     pico_util
     pico_time
+    pico_bootrom
 )
+
+# The control loop runs on the second microcontroller core, which by default
+# only gets 2kB of stack memory. Give it 4kB (it formats text messages, which
+# needs a fair amount). 4kB is the most that fits in the memory area the SDK
+# reserves for this stack.
+target_compile_definitions(levitas PRIVATE PICO_CORE1_STACK_SIZE=0x1000)
+
+# The Pico SDK restarts into BOOTSEL mode (e.g., when picotool asks it to over
+# USB) by calling the functions named below. Make it call our own versions in
+# main.c instead ("__wrap_..."), which first set the high voltage to 0V.
+# (The second function only exists in newer SDK versions.)
+target_link_options(levitas PRIVATE "LINKER:--wrap=rom_reset_usb_boot")
+file(READ ${PICO_SDK_PATH}/src/rp2_common/pico_bootrom/include/pico/bootrom.h BOOTROM_H)
+if(BOOTROM_H MATCHES "rom_reset_usb_boot_extra")
+    target_link_options(levitas PRIVATE "LINKER:--wrap=rom_reset_usb_boot_extra")
+    target_compile_definitions(levitas PRIVATE LEVITAS_WRAP_RESET_USB_BOOT_EXTRA=1)
+endif()
 
 # UART on pins 0/1 is enabled by default. Disable it.
 pico_enable_stdio_uart(levitas 0)
