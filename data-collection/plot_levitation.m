@@ -28,8 +28,8 @@ clear; close all;
 
 % which recording to plot (file names are relative to this script's folder)
 here = fileparts(mfilename('fullpath'));
-data_file = fullfile(here, 'levitation-2026-11-18', 'hold_20s_sp50.csv');
-%data_file = fullfile(here, 'levitation-2026-11-18', 'setpoint_steps_30_to_75.csv');
+% data_file = fullfile(here, 'levitation-2026-11-18', 'hold_20s_sp50.csv');
+data_file = fullfile(here, 'levitation-2026-11-18', 'setpoint_steps_30_to_75.csv');
 %data_file = fullfile(here, 'levitation-2026-11-18', 'calibration_then_steps.csv');
 
 % what the position and the voltage are rescaled to
@@ -112,7 +112,7 @@ switch SCALE_MODE
     case 'minmax'
         h_min = min(height(~isnan(height)));
         h_max = max(height(~isnan(height)));
-        position = (height - h_min)/(h_max - h_min)*POS_SCALE_UM;
+        position = 0.5*(height - h_min)/(h_max - h_min)*POS_SCALE_UM;
         voltage = (hv - min(hv))/(max(hv) - min(hv))*VOLT_SCALE_V;
     case 'fullscale'
         position = height/100*POS_SCALE_UM;
@@ -130,22 +130,22 @@ fig = figure('Color', 'w', 'Position', [100 100 900 480]);
 yyaxis left
 plot(t, position, '-', 'Color', POSITION_COLOR, 'LineWidth', 1.5);
 ylim([0 POS_SCALE_UM]);
-ylabel('Relative position (\mum)');
+ylabel('Position (\mum)');
 set(gca, 'YColor', POSITION_COLOR);
 
 yyaxis right
 plot(t, voltage, '-', 'Color', VOLTAGE_COLOR, 'LineWidth', 1.0);
-ylim([0 VOLT_SCALE_V]);
+ylim([0 VOLT_SCALE_V+1]);
 ylabel('Applied voltage (V)');
 set(gca, 'YColor', VOLTAGE_COLOR);
 
 xlim([-TIME_BEFORE_S, t_stop + TIME_AFTER_S]);
-xlabel('Time since the controller was started (s)');
-title('Closed-loop levitation');
-legend({'Relative position', 'Applied voltage'}, 'Location', 'northeast');
+xlabel('Time (s)');
+% title('Closed-loop levitation');
+legend({'Position', 'Applied voltage'}, 'Location', 'northeast');
 grid on;
 box on;
-set(gca, 'FontSize', 12);
+set(gca, 'FontSize', 18, 'FontName','Times New Roman');
 
 if SAVE_PNG
     print(fig, PNG_FILE, '-dpng', '-r300');
